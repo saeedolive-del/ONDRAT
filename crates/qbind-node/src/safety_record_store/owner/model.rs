@@ -219,6 +219,48 @@ impl BoundedVoteSigner for ErrorFixtureSigner {
     }
 }
 
+/// A bounded, model-only invocation COUNTER that wraps any inner
+/// `BoundedVoteSigner`. It counts ACTUAL `sign_vote_into` calls at the real
+/// signing boundary (incremented BEFORE delegating, so an invocation that
+/// returns an error is still counted) and delegates every other method
+/// unchanged. Unlike `DigestRecordingSigner.seen` — which overwrites a single
+/// cell and therefore records only the LATEST digest/length, not how many times
+/// the signer was called — this is a true invocation count. Digest recording,
+/// when needed, stays on the wrapped inner signer, so the two concerns remain
+/// independent. The counter is a caller-owned fixture (like the sink); it is NOT
+/// part of the model's `signing_charge` working set.
+pub(crate) struct CountingSigner<'a> {
+    inner: &'a dyn BoundedVoteSigner,
+    calls: std::cell::Cell<u32>,
+}
+
+impl<'a> CountingSigner<'a> {
+    pub(crate) fn new(inner: &'a dyn BoundedVoteSigner) -> Self {
+        Self {
+            inner,
+            calls: std::cell::Cell::new(0),
+        }
+    }
+
+    /// The exact number of `sign_vote_into` invocations observed at the boundary.
+    pub(crate) fn calls(&self) -> u32 {
+        self.calls.get()
+    }
+}
+
+impl BoundedVoteSigner for CountingSigner<'_> {
+    fn validator_id(&self) -> u64 {
+        self.inner.validator_id()
+    }
+    fn suite_id(&self) -> u16 {
+        self.inner.suite_id()
+    }
+    fn sign_vote_into(&self, preimage: &[u8], out: &mut [u8]) -> Result<usize, ModelSignError> {
+        self.calls.set(self.calls.get().saturating_add(1));
+        self.inner.sign_vote_into(preimage, out)
+    }
+}
+
 // ===========================================================================
 // Concrete recording sink (fixed-size scalars only; never retains the sig).
 // ===========================================================================
@@ -1280,7 +1322,9 @@ mod tests {
         let pv = make_authority();
         let mut snapshot = established_snapshot(&pv);
         let journal = fresh_journal();
-        let signer = ok_signer();
+        let inner = ok_signer();
+        // Count ACTUAL signer invocations at the boundary (RUN 422 §2).
+        let signer = CountingSigner::new(&inner);
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
         let base_vote = decided.vote().clone();
@@ -1300,7 +1344,7 @@ mod tests {
             ReconfirmPerturbation::None,
         );
 
-        match outcome {
+        let signed_diag = match outcome {
             ModelFreshUseOutcome::Signed(diag) => {
                 assert_eq!(diag.validator_index, SIGNER_VID);
                 assert_eq!(diag.height, 1);
@@ -1315,11 +1359,35 @@ mod tests {
                     diag.preimage_len,
                     MODEL_MAX_PREIMAGE_BYTES
                 );
+                diag
             }
             other => panic!("expected Signed, got {other:?}"),
-        }
+        };
         assert_eq!(sink.calls, 1, "exactly one sink call");
+        // EXACTLY one signer invocation, counted at the boundary — NOT inferred
+        // from the sink/coordination/outcome/digest (RUN 422 §2).
+        assert_eq!(signer.calls(), 1, "exactly one signer invocation");
         assert_eq!(coord.calls, 1, "the coordination point is reached once");
+
+        // The acknowledged journal result contains the expected fixture signature.
+        // Because this operation's result write was durably acknowledged IN THIS
+        // PROCESS (`result_acked = true`), a re-reserve at the exact position and
+        // binding returns `ExactRetryRetained` carrying the retained bytes, which
+        // must equal the OK fixture's 8-byte little-endian preimage-length tag.
+        // This is explicitly in-memory evidence of the recorded result, NOT
+        // process-crash durability evidence.
+        let (pos, binding) = expected_pos_binding(&pv, &base_vote);
+        let expected_sig = (signed_diag.preimage_len as u64).to_le_bytes();
+        match journal.reserve_for_sign(&pos, &binding) {
+            Ok(ReservationOutcome::ExactRetryRetained(sig)) => {
+                assert_eq!(
+                    sig.as_slice(),
+                    &expected_sig[..],
+                    "acknowledged journal result must hold the fixture signature"
+                );
+            }
+            other => panic!("expected ExactRetryRetained with the fixture signature, got {other:?}"),
+        }
 
         // The borrowed envelope / Vote / pin are preserved and unchanged.
         assert_eq!(decided.vote(), &base_vote);
@@ -1513,13 +1581,17 @@ mod tests {
         assert_eq!(outcome, ModelFreshUseOutcome::AuthorizationConfirmRefused);
         assert_eq!(sink.calls, 0, "no signer/sink work after a confirm refusal");
         // The D10 reservation obligation is preserved (reserve+consume happened
-        // before confirm): a re-reserve at the position is NOT freshly reserved.
+        // before confirm): a re-reserve at the exact position/binding, after
+        // consumption without an acknowledged signed result, MUST be exactly
+        // `PotentiallySigned` (RUN 422 §3). Any error, Conflict, Exhausted,
+        // ExactRetryRetained, or FreshlyReserved fails this check.
         let (pos, binding) = expected_pos_binding(&pv, &base_vote);
         match journal.reserve_for_sign(&pos, &binding) {
-            Ok(ReservationOutcome::FreshlyReserved(_)) => {
-                panic!("confirm-refusal must preserve the consumed D10 obligation")
-            }
-            _ => {}
+            Ok(ReservationOutcome::PotentiallySigned) => {}
+            other => panic!(
+                "confirm-refusal must leave the consumed D10 obligation \
+                 PotentiallySigned, got {other:?}"
+            ),
         }
     }
 
@@ -1609,21 +1681,25 @@ mod tests {
         pv: &ProposalVoteAuthority,
         base_vote: &Vote,
     ) {
+        // After consumption WITHOUT an acknowledged signed result, a re-reserve at
+        // the exact same position/binding MUST be exactly `PotentiallySigned`
+        // (RUN 422 §3). An error, Conflict, Exhausted, ExactRetryRetained, or
+        // FreshlyReserved all fail this check — the wildcard "anything but fresh"
+        // acceptance is withdrawn.
         let (pos, binding) = expected_pos_binding(pv, base_vote);
         match journal.reserve_for_sign(&pos, &binding) {
-            Ok(ReservationOutcome::FreshlyReserved(_)) => {
-                panic!("the consumed D10 reservation obligation must be preserved")
-            }
-            // PotentiallySigned / Conflict / Exhausted / ExactRetryRetained are
-            // all acceptable "not fresh" outcomes.
-            _ => {}
+            Ok(ReservationOutcome::PotentiallySigned) => {}
+            other => panic!(
+                "the consumed D10 obligation must be exactly PotentiallySigned, \
+                 got {other:?}"
+            ),
         }
     }
 
     fn run_with_signer(
         dir: &std::path::Path,
         signer: &dyn BoundedVoteSigner,
-    ) -> (ModelFreshUseOutcome, u32, SigningReservationJournal, ProposalVoteAuthority, Vote) {
+    ) -> (ModelFreshUseOutcome, u32, u32, SigningReservationJournal, ProposalVoteAuthority, Vote) {
         let ctx = ctx_n(4);
         let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir, &ctx);
         let pv = make_authority();
@@ -1632,12 +1708,15 @@ mod tests {
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
         let base_vote = decided.vote().clone();
+        // Count ACTUAL signer invocations at the boundary (RUN 422 §2) rather than
+        // inferring them from the sink/outcome.
+        let counting = CountingSigner::new(signer);
         let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
             &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
-            signer, &mut sink, &journal, &mut coord,
+            &counting, &mut sink, &journal, &mut coord,
             ReconfirmPerturbation::None,
         );
-        (outcome, sink.calls, journal, pv, base_vote)
+        (outcome, sink.calls, counting.calls(), journal, pv, base_vote)
     }
 
     #[test]
@@ -1647,9 +1726,12 @@ mod tests {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
         };
-        let (outcome, sink_calls, journal, pv, base_vote) = run_with_signer(dir.path(), &signer);
+        let (outcome, sink_calls, signer_calls, journal, pv, base_vote) =
+            run_with_signer(dir.path(), &signer);
         assert_eq!(outcome, ModelFreshUseOutcome::EmptyWritten);
         assert_eq!(sink_calls, 0);
+        // Exactly one signer invocation and zero sink calls (RUN 422 §2).
+        assert_eq!(signer_calls, 1, "empty-output fault invokes the signer exactly once");
         assert_d10_obligation_preserved(&journal, &pv, &base_vote);
     }
 
@@ -1660,9 +1742,11 @@ mod tests {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
         };
-        let (outcome, sink_calls, journal, pv, base_vote) = run_with_signer(dir.path(), &signer);
+        let (outcome, sink_calls, signer_calls, journal, pv, base_vote) =
+            run_with_signer(dir.path(), &signer);
         assert_eq!(outcome, ModelFreshUseOutcome::OversizeWritten);
         assert_eq!(sink_calls, 0);
+        assert_eq!(signer_calls, 1, "oversize-length fault invokes the signer exactly once");
         assert_d10_obligation_preserved(&journal, &pv, &base_vote);
     }
 
@@ -1673,9 +1757,11 @@ mod tests {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
         };
-        let (outcome, sink_calls, journal, pv, base_vote) = run_with_signer(dir.path(), &signer);
+        let (outcome, sink_calls, signer_calls, journal, pv, base_vote) =
+            run_with_signer(dir.path(), &signer);
         assert_eq!(outcome, ModelFreshUseOutcome::SignerFailed);
         assert_eq!(sink_calls, 0);
+        assert_eq!(signer_calls, 1, "signer-error fault invokes the signer exactly once");
         assert_d10_obligation_preserved(&journal, &pv, &base_vote);
     }
 
