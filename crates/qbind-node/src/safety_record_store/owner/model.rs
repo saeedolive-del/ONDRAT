@@ -33,6 +33,7 @@ use super::super::decision_capture::{
 use super::super::prepared::{GenerationIdentity, PreparedProvenance};
 use super::super::record::ValidatedRecord;
 use super::super::validate::CommittedHistory;
+use super::super::backend::SafetyBackend;
 use super::SafetyRecordOwner;
 
 use qbind_consensus::ids::ValidatorId;
@@ -389,10 +390,22 @@ struct CoordinationProbe {
 /// the guard releases an eligible `publish_locked` may proceed later.
 pub(crate) struct ModelCoordinationHook {
     probe: Option<CoordinationProbe>,
+    /// Optional shared-backend handle used ONLY to sample both accounting ledgers
+    /// at the live signing phase (RUN 422 §5). A clone shares the same inner
+    /// accountant, so reading it here observes the true in-operation charge while
+    /// the control and signing reservations (and the signing objects) are live.
+    /// Sampling reads a separate lock from the domain guard, so it never blocks.
+    sample_backend: Option<SafetyBackend>,
     pub(crate) calls: u32,
     pub(crate) last_excluded: Option<bool>,
     /// Set if any handshake leg failed (send error, receive timeout/disconnect).
     pub(crate) failed: bool,
+    /// The operational ledger charge sampled at the live signing phase, if a
+    /// sampling backend was installed.
+    pub(crate) observed_operational: Option<u128>,
+    /// The aggregate ledger charge sampled at the live signing phase, if a
+    /// sampling backend was installed.
+    pub(crate) observed_aggregate: Option<u128>,
 }
 
 impl ModelCoordinationHook {
@@ -401,9 +414,29 @@ impl ModelCoordinationHook {
     pub(crate) fn inert() -> Self {
         Self {
             probe: None,
+            sample_backend: None,
             calls: 0,
             last_excluded: None,
             failed: false,
+            observed_operational: None,
+            observed_aggregate: None,
+        }
+    }
+
+    /// A hook that, at the live signing phase (post-consume / pre-sign, with the
+    /// control and signing reservations and the signing objects all live), reads
+    /// BOTH accounting ledgers directly from the shared backend (RUN 422 §5). This
+    /// is a bounded, model-only observation: it records two `u128` scalars and does
+    /// no peer handshake.
+    pub(crate) fn sampling(backend: SafetyBackend) -> Self {
+        Self {
+            probe: None,
+            sample_backend: Some(backend),
+            calls: 0,
+            last_excluded: None,
+            failed: false,
+            observed_operational: None,
+            observed_aggregate: None,
         }
     }
 
@@ -422,14 +455,23 @@ impl ModelCoordinationHook {
                 result_rx,
                 timeout,
             }),
+            sample_backend: None,
             calls: 0,
             last_excluded: None,
             failed: false,
+            observed_operational: None,
+            observed_aggregate: None,
         }
     }
 
     fn on_post_consume_pre_sign(&mut self) {
         self.calls = self.calls.saturating_add(1);
+        // RUN 422 §5 — live signing-phase ledger observation. Sampled here, inside
+        // the protected sequence, while the reservations/objects are live.
+        if let Some(b) = &self.sample_backend {
+            self.observed_operational = Some(b.accounting_current());
+            self.observed_aggregate = Some(b.accounting_aggregate_current());
+        }
         if let Some(p) = &self.probe {
             // Leg 1: signal the peer to observe the domain now. A failed send
             // (disconnected peer) is a failed handshake.
@@ -754,6 +796,13 @@ fn fresh_vote_sign_model<H: CommittedHistory + ?Sized>(
     debug_assert!(
         preimage_len as u128 <= MODEL_MAX_PREIMAGE_BYTES,
         "model preimage exceeded the reserved backing bound"
+    );
+    // RUN 422 §5 — verify the returned preimage's CAPACITY (not merely its length)
+    // stays within the conservative bound the signing working set reserved for its
+    // backing. A length check alone is insufficient backing-capacity evidence.
+    debug_assert!(
+        preimage.capacity() as u128 <= MODEL_MAX_PREIMAGE_BYTES,
+        "model preimage backing capacity exceeded the reserved bound"
     );
 
     // 11. D10 reserve -> consume.
@@ -1738,6 +1787,86 @@ mod tests {
             new_rev, 2,
             "an eligible post-release publication advances the authoritative revision"
         );
+    }
+
+    // ======================================================================
+    // §5 — LIVE SIGNING-PHASE LEDGER OBSERVATION. At the fixed post-consume /
+    // pre-sign point the control AND signing reservations (and the signing
+    // objects) are live. A sampling hook reads BOTH accounting ledgers DIRECTLY
+    // at that instant (a contemporaneous measurement, distinct from the
+    // source-derived `baseline + control_charge() + signing_charge()` arithmetic)
+    // and each observed value is asserted against its enforced cap.
+    // ======================================================================
+    #[test]
+    fn live_signing_phase_ledgers_observed_within_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_n(4);
+        let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+        let pv = make_authority();
+        let mut snapshot = established_snapshot(&pv);
+        let journal = fresh_journal();
+        let signer = ok_signer();
+        let mut sink = ModelRecordingSink::new();
+        // The sampling hook shares the SAME backend (a clone shares the inner
+        // accountant), so it reads the true in-operation charge while the
+        // reservations are live.
+        let mut coord = ModelCoordinationHook::sampling(owner.backend_for_test().clone());
+        let base_vote = decided.vote().clone();
+
+        let op_cap = owner
+            .backend_for_test()
+            .accounting_cap()
+            .expect("bounded operational cap");
+        let agg_cap = owner
+            .backend_for_test()
+            .accounting_aggregate_cap()
+            .expect("bounded aggregate cap");
+        let baseline = snapshot_ledgers(&owner);
+
+        let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
+            &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+            &signer, &mut sink, &journal, &mut coord,
+            ReconfirmPerturbation::None,
+        );
+        assert!(matches!(outcome, ModelFreshUseOutcome::Signed(_)), "expected Signed, got {outcome:?}");
+        assert_eq!(coord.calls, 1, "the live observation point ran once");
+
+        // The contemporaneous measurements exist (sampled inside the protected
+        // sequence) and each lies within its enforced cap.
+        let observed_op = coord.observed_operational.expect("operational charge sampled live");
+        let observed_agg = coord.observed_aggregate.expect("aggregate charge sampled live");
+        assert!(
+            observed_op <= op_cap,
+            "live operational charge {observed_op} within the operational cap {op_cap}"
+        );
+        assert!(
+            observed_agg <= agg_cap,
+            "live aggregate charge {observed_agg} within the aggregate cap {agg_cap}"
+        );
+        // The reservations really were live at the sample (both ledgers above the
+        // live baseline that excludes the model's own reservations).
+        assert!(
+            observed_op > baseline.operational && observed_agg > baseline.aggregate,
+            "the live sample reflects the model's own live reservations"
+        );
+        // Cross-check: the live operational and aggregate measurements equal the
+        // source-derived charge arithmetic (control + signing held; lifecycle
+        // already released). Reported separately from the direct measurement.
+        let derived = control_charge() + signing_charge();
+        assert_eq!(
+            observed_op - baseline.operational,
+            derived,
+            "live operational delta matches the source-derived control+signing charge"
+        );
+        assert_eq!(
+            observed_agg - baseline.aggregate,
+            derived,
+            "live aggregate delta matches the source-derived control+signing charge"
+        );
+
+        // Both ledgers are restored after the run and the borrowed Vote is intact.
+        assert_eq!(snapshot_ledgers(&owner), baseline, "both ledgers restored after the run");
+        assert_eq!(decided.vote(), &base_vote, "the complete borrowed Vote is unchanged");
     }
 
     // ======================================================================
