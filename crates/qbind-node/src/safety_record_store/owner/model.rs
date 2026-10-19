@@ -1311,6 +1311,40 @@ mod tests {
         }
     }
 
+    /// Both accounting ledgers sampled together: the operational
+    /// (`accounting_current`) and the aggregate (`accounting_aggregate_current`)
+    /// charged totals. RUN 422 §4 requires observing BOTH directly around a model
+    /// call — ledger equality on one partition alone is insufficient cleanup
+    /// evidence.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct LedgerSnapshot {
+        operational: u128,
+        aggregate: u128,
+    }
+
+    fn snapshot_ledgers(owner: &SafetyRecordOwner) -> LedgerSnapshot {
+        LedgerSnapshot {
+            operational: owner.backend_for_test().accounting_current(),
+            aggregate: owner.backend_for_test().accounting_aggregate_current(),
+        }
+    }
+
+    /// Read the borrowed envelope's pin provenance under a short-lived domain
+    /// guard (a non-consuming observation that charges nothing). Used to prove the
+    /// ORIGINAL pin provenance is unchanged across a model call: ledger equality
+    /// alone does not establish provenance preservation (RUN 422 §4), so the
+    /// fixed-size scalar provenance is compared directly while the envelope/pin
+    /// stay borrowed and live.
+    fn pin_provenance_now(
+        owner: &SafetyRecordOwner,
+        decided: &qbind_consensus::DecidedVote<OwningCapturePayload>,
+    ) -> PreparedProvenance {
+        let guard = owner.backend.lock_domain();
+        owner
+            .pin_provenance_locked(&guard, decided.payload().pin())
+            .expect("pin provenance readable under the domain guard")
+    }
+
     // ======================================================================
     // Scenario 1 — successful fresh execution: exactly ONE signer + ONE sink.
     // ======================================================================
@@ -1328,6 +1362,11 @@ mod tests {
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
         let base_vote = decided.vote().clone();
+
+        // RUN 422 §4 — observe BOTH ledgers and the pin provenance directly before
+        // the model call, keeping the borrowed envelope/pin live for comparison.
+        let ledgers_before = snapshot_ledgers(&owner);
+        let prov_before = pin_provenance_now(&owner, &decided);
 
         let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
             &owner,
@@ -1368,6 +1407,20 @@ mod tests {
         // from the sink/coordination/outcome/digest (RUN 422 §2).
         assert_eq!(signer.calls(), 1, "exactly one signer invocation");
         assert_eq!(coord.calls, 1, "the coordination point is reached once");
+
+        // RUN 422 §4 — BOTH ledgers are restored to their pre-call baseline and the
+        // pin provenance + complete Vote are unchanged after the successful run.
+        let ledgers_after = snapshot_ledgers(&owner);
+        assert_eq!(
+            ledgers_after, ledgers_before,
+            "both operational and aggregate ledgers restored after success"
+        );
+        assert_eq!(
+            pin_provenance_now(&owner, &decided),
+            prov_before,
+            "the original pin provenance is preserved across the successful run"
+        );
+        assert_eq!(decided.vote(), &base_vote, "the complete borrowed Vote is unchanged");
 
         // The acknowledged journal result contains the expected fixture signature.
         // Because this operation's result write was durably acknowledged IN THIS
@@ -1419,7 +1472,8 @@ mod tests {
         let pv = make_authority();
         let mut snapshot = established_snapshot(&pv);
         let journal = fresh_journal();
-        let signer = ok_signer();
+        let inner = ok_signer();
+        let signer = CountingSigner::new(&inner);
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
         let base_vote = decided.vote().clone();
@@ -1434,6 +1488,7 @@ mod tests {
         assert_eq!(outcome, ModelFreshUseOutcome::PolicyRefused);
         assert_eq!(sink.calls, 0);
         assert_eq!(coord.calls, 0);
+        assert_eq!(signer.calls(), 0, "policy refusal invokes the signer zero times");
         assert_no_reservation_made(&journal, &pv, &base_vote);
     }
 
@@ -1445,7 +1500,8 @@ mod tests {
         let pv = make_authority();
         let mut snapshot = established_snapshot(&pv);
         let journal = fresh_journal();
-        let signer = ok_signer();
+        let inner = ok_signer();
+        let signer = CountingSigner::new(&inner);
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
         let base_vote = decided.vote().clone();
@@ -1462,6 +1518,7 @@ mod tests {
         assert_eq!(outcome, ModelFreshUseOutcome::ObservationRefused);
         assert_eq!(sink.calls, 0);
         assert_eq!(coord.calls, 0);
+        assert_eq!(signer.calls(), 0, "observation refusal invokes the signer zero times");
         assert_no_reservation_made(&journal, &pv, &base_vote);
     }
 
@@ -1474,7 +1531,8 @@ mod tests {
         // An unavailable current-authorization owner can never admit.
         let mut snapshot = unavailable_snapshot(&pv);
         let journal = fresh_journal();
-        let signer = ok_signer();
+        let inner = ok_signer();
+        let signer = CountingSigner::new(&inner);
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
         let base_vote = decided.vote().clone();
@@ -1487,6 +1545,7 @@ mod tests {
         assert_eq!(outcome, ModelFreshUseOutcome::AuthorizationAdmitRefused);
         assert_eq!(sink.calls, 0);
         assert_eq!(coord.calls, 0);
+        assert_eq!(signer.calls(), 0, "admission refusal invokes the signer zero times");
         assert_no_reservation_made(&journal, &pv, &base_vote);
     }
 
@@ -1507,11 +1566,12 @@ mod tests {
         let pv = make_authority();
         let mut snapshot = established_snapshot(&pv);
         let journal = fresh_journal();
-        let signer = DigestRecordingSigner {
+        let inner = DigestRecordingSigner {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
             seen: std::cell::Cell::new(None),
         };
+        let signer = CountingSigner::new(&inner);
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
         let base_vote = decided.vote().clone();
@@ -1554,7 +1614,9 @@ mod tests {
         );
         assert_eq!(sink.calls, 0);
         assert_eq!(coord.calls, 0, "no coordination point reached before the lifecycle refusal");
-        assert!(signer.seen.get().is_none(), "zero signer invocations");
+        // Explicit boundary count — NOT inferred from the absence of a digest.
+        assert_eq!(signer.calls(), 0, "zero signer invocations");
+        assert!(inner.seen.get().is_none(), "the wrapped digest signer was never reached");
         assert_no_reservation_made(&journal, &pv, &base_vote);
     }
     // A deterministic in-flight generation advance BETWEEN admit and confirm
@@ -1573,13 +1635,19 @@ mod tests {
         let mut coord = ModelCoordinationHook::inert();
         let base_vote = decided.vote().clone();
 
+        let counting = CountingSigner::new(&signer);
         let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
             &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
-            &signer, &mut sink, &journal, &mut coord,
+            &counting, &mut sink, &journal, &mut coord,
             ReconfirmPerturbation::AdvanceGenerationBeforeConfirm,
         );
         assert_eq!(outcome, ModelFreshUseOutcome::AuthorizationConfirmRefused);
         assert_eq!(sink.calls, 0, "no signer/sink work after a confirm refusal");
+        assert_eq!(
+            counting.calls(),
+            0,
+            "original-ticket confirm refusal invokes the signer zero times"
+        );
         // The D10 reservation obligation is preserved (reserve+consume happened
         // before confirm): a re-reserve at the exact position/binding, after
         // consumption without an acknowledged signed result, MUST be exactly
@@ -1795,14 +1863,16 @@ mod tests {
         let signer = ok_signer();
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
+        let counting = CountingSigner::new(&signer);
         let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
             &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
-            &signer, &mut sink, &journal, &mut coord,
+            &counting, &mut sink, &journal, &mut coord,
             ReconfirmPerturbation::None,
         );
         assert_eq!(outcome, ModelFreshUseOutcome::RetainedBlocked);
         assert_eq!(sink.calls, 0, "no sink on a retained-blocked outcome");
         assert_eq!(coord.calls, 0, "no coordination/signing after retained block");
+        assert_eq!(counting.calls(), 0, "retained-blocked outcome adds zero new signer calls");
     }
 
     // ======================================================================
@@ -1918,11 +1988,12 @@ mod tests {
         let mut expected_digest = [0u8; 32];
         expected_digest.copy_from_slice(&h.finalize());
 
-        let signer = DigestRecordingSigner {
+        let inner = DigestRecordingSigner {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
             seen: std::cell::Cell::new(None),
         };
+        let signer = CountingSigner::new(&inner);
         let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
             &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
             &signer, &mut sink, &journal, &mut coord,
@@ -1930,8 +2001,11 @@ mod tests {
         );
         assert!(matches!(outcome, ModelFreshUseOutcome::Signed(_)));
         assert_eq!(sink.calls, 1, "exactly one sink call");
+        // Exactly one signer invocation, counted at the boundary — independent of
+        // the digest recording that proves the input preimage (RUN 422 §2).
+        assert_eq!(signer.calls(), 1, "exactly one signer invocation");
         let (seen_digest, seen_len) =
-            signer.seen.get().expect("the signer was invoked exactly once");
+            inner.seen.get().expect("the signer recorded its single input");
         assert_eq!(
             seen_len,
             expected_preimage.len(),
@@ -1962,11 +2036,12 @@ mod tests {
         let journal = fresh_journal();
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
-        let signer = DigestRecordingSigner {
+        let inner = DigestRecordingSigner {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
             seen: std::cell::Cell::new(None),
         };
+        let signer = CountingSigner::new(&inner);
         let base_vote = decided.vote().clone();
 
         let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
@@ -1977,7 +2052,8 @@ mod tests {
         assert_eq!(outcome, ModelFreshUseOutcome::WrongWireChain);
         assert_eq!(sink.calls, 0);
         assert_eq!(coord.calls, 0, "no coordination point reached before the refusal");
-        assert!(signer.seen.get().is_none(), "zero signer invocations");
+        assert_eq!(signer.calls(), 0, "zero signer invocations");
+        assert!(inner.seen.get().is_none(), "the wrapped signer was never reached");
         assert_no_reservation_made(&journal, &pv, &base_vote);
     }
 
@@ -1997,11 +2073,12 @@ mod tests {
         let journal = fresh_journal();
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
-        let signer = DigestRecordingSigner {
+        let inner = DigestRecordingSigner {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
             seen: std::cell::Cell::new(None),
         };
+        let signer = CountingSigner::new(&inner);
         let base_vote = decided.vote().clone();
         assert_eq!(base_vote.epoch, 0, "the engine self-vote epoch is 0");
         assert_eq!(snapshot.authorized_epoch(), 0, "authorized epoch is genesis-static 0");
@@ -2014,7 +2091,8 @@ mod tests {
         assert_eq!(outcome, ModelFreshUseOutcome::WrongAuthorizedEpoch);
         assert_eq!(sink.calls, 0);
         assert_eq!(coord.calls, 0, "no coordination point reached before the refusal");
-        assert!(signer.seen.get().is_none(), "zero signer invocations");
+        assert_eq!(signer.calls(), 0, "zero signer invocations");
+        assert!(inner.seen.get().is_none(), "the wrapped signer was never reached");
         assert_no_reservation_made(&journal, &pv, &base_vote);
         // The captured envelope is untouched by the model-owned perturbation.
         assert_eq!(decided.vote(), &base_vote);
@@ -2060,12 +2138,19 @@ mod tests {
         let journal = fresh_journal();
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
-        let signer = DigestRecordingSigner {
+        let inner = DigestRecordingSigner {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
             seen: std::cell::Cell::new(None),
         };
+        let signer = CountingSigner::new(&inner);
         let base_vote = decided.vote().clone();
+
+        // RUN 422 §4 step 1 — snapshot BOTH ledgers before any pressure, with the
+        // envelope/pin live. This baseline already includes the standing registry
+        // charge carried by the fixture setup.
+        let ledgers_original = snapshot_ledgers(&owner);
+        let prov_before = pin_provenance_now(&owner, &decided);
 
         let cap = owner
             .backend_for_test()
@@ -2076,10 +2161,14 @@ mod tests {
         // (aggregate) ledger so the control reservation (the first model
         // reservation) cannot be admitted.
         let standing = cap - current - (control_charge() - 1);
-        let _pressure = owner
+        let pressure = owner
             .backend_for_test()
             .reserve_standing_for_test(standing)
             .expect("standing reservation fits under the cap");
+
+        // RUN 422 §4 step 2 — snapshot BOTH ledgers with the temporary pressure
+        // held (the pressure-held baseline the refusal must restore to).
+        let ledgers_pressure = snapshot_ledgers(&owner);
 
         let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
             &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
@@ -2089,8 +2178,56 @@ mod tests {
         assert_eq!(outcome, ModelFreshUseOutcome::AuthorizationAdmitRefused);
         assert_eq!(sink.calls, 0);
         assert_eq!(coord.calls, 0);
-        assert!(signer.seen.get().is_none(), "zero signer invocations");
-        assert_no_reservation_made(&journal, &pv, &base_vote);
+        assert_eq!(signer.calls(), 0, "zero signer invocations");
+        assert!(inner.seen.get().is_none(), "the wrapped signer was never reached");
+
+        // RUN 422 §4 step 3 — after the refusal BOTH ledgers are restored exactly
+        // to the pressure-held baseline (the model released every reservation it
+        // took before refusing).
+        assert_eq!(
+            snapshot_ledgers(&owner),
+            ledgers_pressure,
+            "both ledgers restored to the pressure-held baseline after the control refusal"
+        );
+        // Pin provenance and the complete Vote are unchanged across the refusal.
+        assert_eq!(
+            pin_provenance_now(&owner, &decided),
+            prov_before,
+            "pin provenance preserved across the control-admission refusal"
+        );
+        assert_eq!(decided.vote(), &base_vote, "the complete borrowed Vote is unchanged");
+        // Non-mutating postcondition: the refusal left NO reserved journal position
+        // (observed WITHOUT reserving it, so the retry below can reuse it).
+        assert_eq!(
+            journal.reserved_position_count(),
+            0,
+            "control refusal leaves no reserved D10 position"
+        );
+
+        // RUN 422 §4 step 4 — drop the pressure and require restoration to the
+        // ORIGINAL baseline.
+        drop(pressure);
+        assert_eq!(
+            snapshot_ledgers(&owner),
+            ledgers_original,
+            "both ledgers restored to the original baseline once pressure is dropped"
+        );
+
+        // RUN 422 §4 step 5 — retry the previously refused but now-admissible
+        // operation using the SAME envelope and journal: it succeeds.
+        let mut sink2 = ModelRecordingSink::new();
+        let mut coord2 = ModelCoordinationHook::inert();
+        let signer2 = ok_signer();
+        let outcome2 = fresh_vote_sign_model::<FixtureCommittedHistory>(
+            &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+            &signer2, &mut sink2, &journal, &mut coord2,
+            ReconfirmPerturbation::None,
+        );
+        assert!(
+            matches!(outcome2, ModelFreshUseOutcome::Signed(_)),
+            "after relief the admissible operation succeeds, got {outcome2:?}"
+        );
+        assert_eq!(sink2.calls, 1);
     }
 
     // ======================================================================
@@ -2110,11 +2247,17 @@ mod tests {
         let journal = fresh_journal();
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
-        let signer = DigestRecordingSigner {
+        let inner = DigestRecordingSigner {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
             seen: std::cell::Cell::new(None),
         };
+        let signer = CountingSigner::new(&inner);
+        let base_vote = decided.vote().clone();
+
+        // RUN 422 §4 step 1 — snapshot BOTH ledgers before any pressure.
+        let ledgers_original = snapshot_ledgers(&owner);
+        let prov_before = pin_provenance_now(&owner, &decided);
 
         let cap = owner
             .backend_for_test()
@@ -2130,6 +2273,9 @@ mod tests {
             .reserve_standing_for_test(standing)
             .expect("standing reservation fits under the cap");
 
+        // RUN 422 §4 step 2 — snapshot BOTH ledgers with the pressure held.
+        let ledgers_pressure = snapshot_ledgers(&owner);
+
         let outcome = fresh_vote_sign_model::<FixtureCommittedHistory>(
             &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
             &signer, &mut sink, &journal, &mut coord,
@@ -2142,14 +2288,38 @@ mod tests {
         );
         assert_eq!(sink.calls, 0);
         assert_eq!(coord.calls, 0, "no coordination point reached before the signing refusal");
-        assert!(signer.seen.get().is_none(), "zero signer invocations");
+        assert_eq!(signer.calls(), 0, "zero signer invocations");
+        assert!(inner.seen.get().is_none(), "the wrapped signer was never reached");
+
+        // RUN 422 §4 step 3 — after the refusal BOTH ledgers are restored exactly
+        // to the pressure-held baseline (the held control reservation and the
+        // transient lifecycle load were released).
+        assert_eq!(
+            snapshot_ledgers(&owner),
+            ledgers_pressure,
+            "both ledgers restored to the pressure-held baseline after the signing refusal"
+        );
+        assert_eq!(
+            pin_provenance_now(&owner, &decided),
+            prov_before,
+            "pin provenance preserved across the signing-admission refusal"
+        );
+        assert_eq!(decided.vote(), &base_vote, "the complete borrowed Vote is unchanged");
         // Non-destructive: the refusal left NO reserved position (the journal is
-        // untouched, so the retry below can reuse it).
+        // untouched, so the retry below can reuse it) — observed WITHOUT reserving.
         assert_eq!(journal.reserved_position_count(), 0, "no D10 reservation on a signing refusal");
 
-        // Remove the temporary pressure and retry the previously refused but
-        // admissible operation on the SAME (clean) journal: it now succeeds.
+        // RUN 422 §4 step 4 — remove the temporary pressure and require restoration
+        // to the ORIGINAL baseline.
         drop(pressure);
+        assert_eq!(
+            snapshot_ledgers(&owner),
+            ledgers_original,
+            "both ledgers restored to the original baseline once pressure is dropped"
+        );
+
+        // RUN 422 §4 step 5 — retry the previously refused but admissible operation
+        // on the SAME (clean) journal: it now succeeds.
         let mut sink2 = ModelRecordingSink::new();
         let mut coord2 = ModelCoordinationHook::inert();
         let signer2 = ok_signer();
@@ -2186,11 +2356,12 @@ mod tests {
                 .expect("initialize journal over the wrapper store");
         let mut sink = ModelRecordingSink::new();
         let mut coord = ModelCoordinationHook::inert();
-        let signer = DigestRecordingSigner {
+        let inner = DigestRecordingSigner {
             validator_id: SIGNER_VID,
             suite_id: MODEL_SUITE_U16,
             seen: std::cell::Cell::new(None),
         };
+        let signer = CountingSigner::new(&inner);
         let base_vote = decided.vote().clone();
 
         // Arm the wrapper to fail ONLY the record_signed_result single-record
@@ -2204,9 +2375,11 @@ mod tests {
         );
         assert_eq!(outcome, ModelFreshUseOutcome::PersistFailed);
         assert_eq!(sink.calls, 0, "the sink is suppressed on a persistence failure");
-        // The signer WAS invoked exactly once (persist fails AFTER signing).
+        // The signer WAS invoked exactly once (persist fails AFTER signing), and
+        // the sink zero times — counted at the boundary, not inferred (RUN 422 §2).
+        assert_eq!(signer.calls(), 1, "exactly one signer invocation before the persist failure");
         assert!(
-            signer.seen.get().is_some(),
+            inner.seen.get().is_some(),
             "the signer ran once before the persistence failure"
         );
         assert_eq!(coord.calls, 1, "the coordination point ran before signing");
