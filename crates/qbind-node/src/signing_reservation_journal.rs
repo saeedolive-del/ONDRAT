@@ -1239,6 +1239,16 @@ struct DomainInner {
     /// Monotonic source of unique live operation ids (checked; exhaustion is a
     /// terminal fail-closed state, never wraparound). In-process bookkeeping.
     next_operation_id: u64,
+    /// Run 422 — the non-enabling accountant association for this signing
+    /// domain: at most ONE operational-ledger identity, recorded the first time
+    /// an association is installed and thereafter reused for identical-ledger
+    /// installs. It is identity bookkeeping ONLY: it enables no bounded signing
+    /// route, admits no memory, takes no accounting charge, and does not gate
+    /// any existing reservation/continuation/publication/workspace path. The
+    /// held clone is Arc-backed shared ownership of the EXISTING ledger (no new
+    /// ledger is allocated); it survives individual journal/facade handle drops
+    /// because the ownership domain outlives them.
+    admission: Option<crate::safety_record_store::accounting::SharedAccountant>,
 }
 
 impl SigningOwnershipDomain {
@@ -1272,6 +1282,7 @@ impl SigningOwnershipDomain {
                 accounting_uncertain: false,
                 uncertain_attempt: None,
                 next_operation_id: 1,
+                admission: None,
             }),
         })
     }
@@ -1293,6 +1304,21 @@ impl SigningOwnershipDomain {
 // ============================================================================
 // The journal
 // ============================================================================
+
+/// Run 422 — fixed-size, crate-internal refusal for installing the
+/// non-enabling accountant association. It is `Copy` and allocation-free: it
+/// carries no `String` and no owned payload, so constructing or returning it on
+/// any branch takes no accounting lock and performs no heap allocation. It is
+/// deliberately distinct from [`JournalError`], whose variants carry allocating
+/// diagnostic strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionInstallError {
+    /// A different operational ledger is already associated with this signing
+    /// domain; the installed association is left unchanged.
+    LedgerMismatch,
+    /// The signing-domain mutex was poisoned by a panic in another holder.
+    LockPoisoned,
+}
 
 /// A bounded, versioned, signing-scoped, crash-consistent reservation journal
 /// **handle** over one shared [`SigningOwnershipDomain`].
@@ -1320,6 +1346,55 @@ impl std::fmt::Debug for SigningReservationJournal {
 }
 
 impl SigningReservationJournal {
+    /// Run 422 — install the **non-enabling accountant association** for this
+    /// journal's signing-ownership domain.
+    ///
+    /// This records at most ONE operational-ledger identity for the domain. It
+    /// is identity-only bookkeeping: it does NOT enable any bounded fresh-signing
+    /// route, admit journal memory, take any accounting charge, allocate or
+    /// retire a live-operation table, or alter any existing reservation,
+    /// continuation, publication-capability, retained-retrieval, storage-write,
+    /// or workspace path. Installing an association never flips the domain into
+    /// a “bounded-only” mode.
+    ///
+    /// All work happens under a SINGLE acquisition of the existing signing-domain
+    /// mutex (the same lock that serializes every supported handle over this
+    /// domain). No accounting lock is taken, no reservation is created, and no
+    /// second synchronization mechanism or out-of-lock installation candidate is
+    /// introduced:
+    ///
+    /// * **Unassociated** (`None`): one clone of `accountant` is retained — an
+    ///   Arc refcount bump sharing the EXISTING ledger, not a new ledger — and
+    ///   the call succeeds.
+    /// * **Same installed ledger**: succeeds WITHOUT replacing or re-cloning the
+    ///   stored value.
+    /// * **Different installed ledger**: refused with
+    ///   [`AdmissionInstallError::LedgerMismatch`]; the association is unchanged.
+    /// * **Poisoned mutex**: refused with [`AdmissionInstallError::LockPoisoned`].
+    ///
+    /// Because the association lives in the shared ownership domain (behind the
+    /// domain `Arc`), it outlives the individual journal/facade handles that
+    /// installed it and remains observable to any later handle opened over the
+    /// same backend instance.
+    pub(crate) fn install_accountant_association(
+        &self,
+        accountant: &crate::safety_record_store::accounting::SharedAccountant,
+    ) -> Result<(), AdmissionInstallError> {
+        let mut inner = self
+            .domain
+            .inner
+            .lock()
+            .map_err(|_| AdmissionInstallError::LockPoisoned)?;
+        match inner.admission.as_ref() {
+            None => {
+                inner.admission = Some(accountant.clone());
+                Ok(())
+            }
+            Some(existing) if existing.same_ledger(accountant) => Ok(()),
+            Some(_) => Err(AdmissionInstallError::LedgerMismatch),
+        }
+    }
+
     /// Run 422 D7-D10 Correction E — **explicitly initialize a new local
     /// journal**. This is the only route that creates initialization metadata; it
     /// requires an **empty signing namespace** (no metadata and no records) and
