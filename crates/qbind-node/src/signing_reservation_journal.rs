@@ -831,6 +831,196 @@ pub struct ResultPublicationCapability {
 }
 
 // ============================================================================
+// RUN 422 — additive, isolated ADMITTED fresh-reservation route types.
+//
+// These wrap the existing operation-bound continuation / publication capability
+// with the covered-ownership model: each opaque wrapper OWNS the single
+// continuation reservation (`coverage`) issued by the installed operational
+// accountant, so coverage persists exactly as long as the caller retains the
+// capability. The wrapped inner value preserves EVERY existing domain,
+// operation-id, position, binding, invocation, and acknowledgement check; the
+// non-`Clone` wrapper adds coverage ownership, never a second authorization.
+// ============================================================================
+
+/// RUN 422 — an admitted, covered [`SigningContinuation`]: the single authority
+/// to invoke the signer for exactly one freshly admitted reservation, together
+/// with the continuation [`Reservation`](crate::safety_record_store::accounting::Reservation)
+/// it owns. The coverage moved in at construction is released only when this
+/// wrapper drops unconsumed, or flows UNCHANGED into the publication capability on
+/// consumption (never released and re-charged). All fields are private;
+/// constructed only inside this module after a durable fresh-reservation
+/// acknowledgement.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct AdmittedContinuation {
+    inner: SigningContinuation,
+    coverage: crate::safety_record_store::accounting::Reservation,
+}
+
+impl AdmittedContinuation {
+    /// The canonical position this continuation authorizes signing for.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn position(&self) -> SigningPosition {
+        self.inner.position
+    }
+
+    /// The charge held by the owned continuation coverage (observer).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn coverage_charge(&self) -> u128 {
+        self.coverage.charge()
+    }
+
+    /// True iff the owned coverage was issued by `acct` (observer).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_covered_by(
+        &self,
+        acct: &crate::safety_record_store::accounting::SharedAccountant,
+    ) -> bool {
+        self.coverage.is_issued_by(acct)
+    }
+}
+
+/// RUN 422 — an admitted, covered [`ResultPublicationCapability`]: the authority
+/// to publish the result of the exact operation that reserved a decision and
+/// crossed the signer-invocation boundary, together with the SAME continuation
+/// coverage transferred through consumption (no release/recharge). All fields are
+/// private; the raw inner capability is never exposed outside this module, so
+/// retirement accesses it only here.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct AdmittedPublicationCapability {
+    inner: ResultPublicationCapability,
+    coverage: crate::safety_record_store::accounting::Reservation,
+}
+
+impl AdmittedPublicationCapability {
+    /// The canonical position this capability publishes for.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn position(&self) -> SigningPosition {
+        self.inner.position
+    }
+
+    /// The charge held by the owned continuation coverage (observer).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn coverage_charge(&self) -> u128 {
+        self.coverage.charge()
+    }
+
+    /// True iff the owned coverage was issued by `acct` (observer).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_covered_by(
+        &self,
+        acct: &crate::safety_record_store::accounting::SharedAccountant,
+    ) -> bool {
+        self.coverage.is_issued_by(acct)
+    }
+}
+
+/// RUN 422 — the outcome of an admitted fresh-reservation attempt. It carries NO
+/// lifetime and NO retained-signature bytes: an existing-position classification
+/// is a fixed-code variant, never a newly allocated signature `Vec`. Delivery of
+/// any retained result remains the responsibility of the already-completed
+/// checked retrieval path, not this route.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum AdmittedReservationOutcome {
+    /// A fresh reservation was durably acknowledged; the enclosed covered
+    /// continuation is the one live operation's authority to sign once.
+    FreshlyReserved(AdmittedContinuation),
+    /// A conflicting decision (same position, different binding) exists.
+    Conflict,
+    /// A durable `Reserved` record exists for this position; never re-signable.
+    ReservedPotentiallySigned,
+    /// A `Signed` record exists with a live, result-UNacknowledged operation in
+    /// this process; treated as potentially signed (no delivery).
+    LiveUnacknowledgedPotentiallySigned,
+    /// A `Signed` record exists with NO live entry (or a live acknowledged one):
+    /// retainable ONLY through the separate checked retrieval path, never here.
+    SignedRetainableElsewhere,
+    /// The durable journal-wide reserved-position limit is exhausted.
+    Exhausted,
+    /// The bounded live container is at capacity; no fresh slot is available.
+    LiveCapacityExhausted,
+    /// A stored envelope exceeds the admitted workspace capacity (bounded refusal).
+    WorkspaceCapacityExceeded,
+    /// Journal accounting is uncertain; refused conservatively with no fresh
+    /// continuation. The route never implicitly invokes legacy reconciliation.
+    AccountingUncertain,
+}
+
+/// RUN 422 — fixed-size, `Copy`, allocation-free refusal for the admitted
+/// fresh-reservation entrypoint. Distinct from the allocating [`JournalError`]:
+/// no heap-bearing or attacker-controlled content is carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum AdmittedReserveError {
+    /// The journal domain has not been established (no `initialize`/`open`).
+    NotEstablished,
+    /// The journal domain is not in bounded live mode; the admitted route does not
+    /// auto-transition or fall back to the legacy allocating route.
+    NotBoundedMode,
+    /// No operational accountant association is installed; the route does not
+    /// auto-install one.
+    NoAssociation,
+    /// The signing-domain mutex was poisoned by a panic in another holder.
+    Lock,
+    /// The supplied workspace is not covered by the installed operational ledger +
+    /// aggregate authority. Returned BEFORE any storage access.
+    ForeignWorkspace,
+    /// The backend does not support the bounded envelope read/write path.
+    Unsupported,
+    /// The canonical position key could not be encoded within its fixed layout.
+    KeyInvalid,
+    /// Checked operation-id / position-count arithmetic overflowed.
+    Overflow,
+    /// A backend storage read/write error (fixed diagnostic code).
+    Storage(BoundedDiag),
+}
+
+/// RUN 422 — fixed-size, `Copy`, allocation-free refusal for admitted
+/// continuation consumption. Distinct from the allocating [`JournalError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum AdmittedConsumeError {
+    /// The signing-journal ownership mutex was poisoned.
+    LockPoisoned,
+    /// The continuation belongs to a foreign ownership domain.
+    ForeignDomain,
+    /// No fresh (un-invoked, exactly-matching) live operation owns this position.
+    NoFreshLiveOp,
+}
+
+/// RUN 422 — the ONE shared live-consumption state transition, performed under a
+/// lock the caller already holds. It checks the foreign-domain token FIRST (no
+/// live mutation on a foreign continuation), then requires a live entry at
+/// `position` whose `operation_id`, `binding` match and that is not yet invoked;
+/// on success it marks the entry invoked. It mutates ONLY the matched live entry
+/// and never touches storage, accounting, or any other domain state. Both the
+/// legacy [`consume_for_signing`](SigningReservationJournal::consume_for_signing)
+/// and the admitted [`consume_for_signing_admitted`](SigningReservationJournal::consume_for_signing_admitted)
+/// route through it, so the exact live-ownership check is identical on both paths.
+#[cfg_attr(not(test), allow(dead_code))]
+fn consume_live_locked(
+    inner: &mut DomainInner,
+    expected_domain_token: u64,
+    cont_domain_token: u64,
+    position: &SigningPosition,
+    binding: &BindingDigest,
+    operation_id: u64,
+) -> Result<(), AdmittedConsumeError> {
+    if cont_domain_token != expected_domain_token {
+        return Err(AdmittedConsumeError::ForeignDomain);
+    }
+    match inner.live.get_mut(position) {
+        Some(ls) if ls.operation_id == operation_id && ls.binding == *binding && !ls.invoked => {
+            ls.invoked = true;
+            Ok(())
+        }
+        _ => Err(AdmittedConsumeError::NoFreshLiveOp),
+    }
+}
+
+// ============================================================================
 // Backing store abstraction and shared ownership domain
 // ============================================================================
 
@@ -2743,6 +2933,351 @@ impl SigningReservationJournal {
         Ok(RetirementOutcome::Retired)
     }
 
+    /// RUN 422 — association-sourced admission of the admitted FRESH-RESERVATION
+    /// workspace. Like [`admit_retrieval_workspace`](Self::admit_retrieval_workspace)
+    /// it sources its accountant EXCLUSIVELY from the accountant already installed
+    /// in this journal's ownership-domain association: it acquires the domain mutex
+    /// ONCE, refuses `NoAssociation` if none is installed (or `Lock` on poisoning),
+    /// clones the installed handle (an `Arc` refcount bump sharing the EXISTING
+    /// ledger — no new ledger), RELEASES the guard, and moves that handle into the
+    /// [`ReserveWorkspaceOwner`](crate::signing_journal_admission::ReserveWorkspaceOwner)
+    /// admission mechanism. That owner reserves BOTH coverages (working-set first,
+    /// then continuation) BEFORE constructing the workspace and rolls the first
+    /// back if the second refuses, so a capacity refusal builds no workspace and
+    /// leaves both ledgers unchanged.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn admit_reserve_workspace(
+        &self,
+    ) -> Result<crate::signing_journal_admission::AdmittedReserveWorkspace, WorkspaceAdmissionError>
+    {
+        let accountant = {
+            let inner = self
+                .domain
+                .inner
+                .lock()
+                .map_err(|_| WorkspaceAdmissionError::Lock)?;
+            match inner.admission.as_ref() {
+                None => return Err(WorkspaceAdmissionError::NoAssociation),
+                Some(a) => a.clone(),
+            }
+            // Domain guard released here, before any reservation is attempted.
+        };
+        crate::signing_journal_admission::ReserveWorkspaceOwner::from_installed(accountant)
+            .admit()
+            .map_err(map_admission_error)
+    }
+
+    /// RUN 422 — the additive, isolated ADMITTED fresh-reservation route. It
+    /// consumes the admitted workspace BY VALUE and acquires the ownership domain
+    /// ONCE. Prerequisites are checked fail-closed BEFORE any storage access, in
+    /// order: established journal, bounded live mode, installed accountant, and
+    /// BOTH workspace coverages issued by that accountant (else `ForeignWorkspace`).
+    /// It never auto-installs an association, auto-transitions into bounded mode, or
+    /// falls back to the legacy allocating route.
+    ///
+    /// If journal accounting is uncertain it refuses conservatively
+    /// (`AccountingUncertain`) with ZERO side effects and NO fresh continuation; it
+    /// never implicitly runs legacy reconciliation. Otherwise it classifies the
+    /// position with a single bounded, NON-delivering read (no retained signature is
+    /// ever read, acknowledged, or returned here — retained delivery stays with the
+    /// separate checked retrieval path):
+    ///
+    /// * conflicting binding → `Conflict`;
+    /// * durable `Reserved` → `ReservedPotentiallySigned`;
+    /// * `Signed` with a live, result-unacknowledged operation →
+    ///   `LiveUnacknowledgedPotentiallySigned`;
+    /// * `Signed` otherwise → `SignedRetainableElsewhere`.
+    ///
+    /// On a fresh (record-absent) position it settles the durable limit and bounded
+    /// slot availability, frames the reserved record and advanced metadata into the
+    /// workspace, and publishes them together through the EXISTING atomic
+    /// envelope-pair storage primitive. A failed/uncertain write latches accounting
+    /// uncertain (recording the tracked attempt), advances no counter, and returns
+    /// no continuation — subsequent admitted calls stay blocked. Only after the
+    /// durable acknowledgement does it commit the accounting, install the live
+    /// entry, END the domain-guard scope, and move the continuation coverage
+    /// directly out of the workspace into the returned covered continuation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn reserve_for_sign_admitted(
+        &self,
+        position: &SigningPosition,
+        binding: &BindingDigest,
+        mut ws: crate::signing_journal_admission::AdmittedReserveWorkspace,
+    ) -> Result<AdmittedReservationOutcome, AdmittedReserveError> {
+        use crate::signing_journal_admission::BorrowedRecordView;
+
+        let mut inner = self
+            .domain
+            .inner
+            .lock()
+            .map_err(|_| AdmittedReserveError::Lock)?;
+
+        // (1) Established journal (one journal-wide position limit).
+        let limit = inner
+            .established
+            .ok_or(AdmittedReserveError::NotEstablished)?
+            .max_reserved_positions;
+
+        // (2) Bounded live mode required; never auto-transition.
+        if inner.live.bounded_capacity().is_none() {
+            return Err(AdmittedReserveError::NotBoundedMode);
+        }
+
+        // (3) Installed accountant required; the supplied workspace's BOTH
+        //     coverages must be issued by it. Checked BEFORE any storage access;
+        //     never auto-install. The borrow ends with this scope.
+        {
+            let accountant = inner
+                .admission
+                .as_ref()
+                .ok_or(AdmittedReserveError::NoAssociation)?;
+            if !(ws.is_work_covered_by(accountant) && ws.is_cont_covered_by(accountant)) {
+                return Err(AdmittedReserveError::ForeignWorkspace);
+            }
+        }
+
+        // (4) Conservative uncertainty refusal: no reconciliation, no write, no
+        //     fresh continuation.
+        if inner.accounting_uncertain {
+            return Ok(AdmittedReservationOutcome::AccountingUncertain);
+        }
+
+        // (5) Non-allocating key encode into the admitted key buffer.
+        let klen = position
+            .encode_key_into(ws.journal_key_buf())
+            .map_err(|_| AdmittedReserveError::KeyInvalid)?;
+        ws.set_jkey_len(klen);
+
+        // (6) Bounded classification read with disjoint key/envelope borrows.
+        let used = {
+            let (jk, env) = ws.key_and_read_env();
+            match self.store.read_signing_envelope_into(jk, env) {
+                Ok(None) => None,
+                Ok(Some(n)) => Some(n),
+                Err(BoundedStorageError::CapacityExceeded { .. }) => {
+                    return Ok(AdmittedReservationOutcome::WorkspaceCapacityExceeded);
+                }
+                Err(BoundedStorageError::Unsupported) => {
+                    return Err(AdmittedReserveError::Unsupported);
+                }
+                Err(BoundedStorageError::Corruption(d)) | Err(BoundedStorageError::Io(d)) => {
+                    return Err(AdmittedReserveError::Storage(d));
+                }
+            }
+        };
+
+        // (7) Existing-position classification (bounded, NON-delivering).
+        if let Some(n) = used {
+            ws.set_read_used(n)
+                .map_err(|_| AdmittedReserveError::Storage(BoundedDiag::EnvelopeInvalid))?;
+            let stage;
+            let decoded_position;
+            let decoded_binding;
+            {
+                let view = match BorrowedRecordView::parse(ws.read_envelope()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(AdmittedReserveError::Storage(BoundedDiag::EnvelopeInvalid));
+                    }
+                };
+                if view.magic != &RECORD_MAGIC[..]
+                    || view.version != SIGNING_RECORD_FORMAT_VERSION
+                {
+                    return Err(AdmittedReserveError::Storage(BoundedDiag::DecodeInvalid));
+                }
+                let kind = match SigningKind::from_tag(view.kind_tag) {
+                    Some(k) => k,
+                    None => {
+                        return Err(AdmittedReserveError::Storage(BoundedDiag::DecodeInvalid));
+                    }
+                };
+                stage = match SigningRecordStage::from_tag(view.stage_tag) {
+                    Some(st) => st,
+                    None => {
+                        return Err(AdmittedReserveError::Storage(BoundedDiag::DecodeInvalid));
+                    }
+                };
+                let mut genesis = [0u8; 32];
+                genesis.copy_from_slice(view.network_genesis);
+                decoded_position = SigningPosition {
+                    validator_id: view.validator_id,
+                    network_genesis: genesis,
+                    kind,
+                    originating_view: view.originating_view,
+                };
+                let mut bind = [0u8; 32];
+                bind.copy_from_slice(view.binding);
+                decoded_binding = BindingDigest(bind);
+            }
+            // Position/key-derivation invariant: a record under this key for
+            // another position is a storage/derivation fault — refuse fail-closed.
+            if decoded_position != *position {
+                return Err(AdmittedReserveError::Storage(BoundedDiag::DecodeInvalid));
+            }
+            if decoded_binding != *binding {
+                return Ok(AdmittedReservationOutcome::Conflict);
+            }
+            return match stage {
+                SigningRecordStage::Reserved => {
+                    Ok(AdmittedReservationOutcome::ReservedPotentiallySigned)
+                }
+                SigningRecordStage::Signed => {
+                    match inner.live.get(position).map(|ls| ls.result_acked) {
+                        Some(false) => {
+                            Ok(AdmittedReservationOutcome::LiveUnacknowledgedPotentiallySigned)
+                        }
+                        Some(true) | None => {
+                            Ok(AdmittedReservationOutcome::SignedRetainableElsewhere)
+                        }
+                    }
+                }
+            };
+        }
+
+        // (8) Fresh path: settle the durable limit and bounded-slot availability
+        //     BEFORE any durable write.
+        if inner.reserved_positions >= limit {
+            return Ok(AdmittedReservationOutcome::Exhausted);
+        }
+        if !inner.live.can_admit_fresh() {
+            return Ok(AdmittedReservationOutcome::LiveCapacityExhausted);
+        }
+        let operation_id = inner.next_operation_id;
+        let next_operation_id = operation_id
+            .checked_add(1)
+            .ok_or(AdmittedReserveError::Overflow)?;
+        let new_reserved = inner
+            .reserved_positions
+            .checked_add(1)
+            .ok_or(AdmittedReserveError::Overflow)?;
+
+        // Frame the reserved record and advanced accounting metadata into the
+        // admitted workspace (pre-framed, outer-CRC-prefixed), BEFORE any write.
+        let record = SigningDecisionRecord::reserved(*position, *binding);
+        let encoded = record
+            .encode()
+            .map_err(|_| AdmittedReserveError::Storage(BoundedDiag::EnvelopeInvalid))?;
+        ws.set_framed_record(&encoded)
+            .map_err(|_| AdmittedReserveError::Storage(BoundedDiag::EnvelopeInvalid))?;
+        let metadata = SigningJournalMetadata::new(limit, new_reserved);
+        let metadata_encoded = metadata.encode();
+        ws.set_framed_metadata(&metadata_encoded)
+            .map_err(|_| AdmittedReserveError::Storage(BoundedDiag::EnvelopeInvalid))?;
+
+        // Atomic combined record+metadata synced write via the EXISTING
+        // envelope-pair primitive. A failed/uncertain acknowledgement does NOT
+        // prove nothing was stored: latch accounting uncertain and record the
+        // tracked attempt; grant no continuation and do not advance the counter.
+        match self.store.put_signing_envelope_and_metadata_synced(
+            ws.journal_key(),
+            ws.framed_record(),
+            ws.framed_metadata(),
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                inner.accounting_uncertain = true;
+                inner.uncertain_attempt = Some(UncertainAttempt {
+                    prior_count: inner.reserved_positions,
+                    attempted_count: new_reserved,
+                });
+                return Err(match e {
+                    BoundedStorageError::CapacityExceeded { .. } => {
+                        AdmittedReserveError::Storage(BoundedDiag::EnvelopeInvalid)
+                    }
+                    BoundedStorageError::Unsupported => AdmittedReserveError::Unsupported,
+                    BoundedStorageError::Corruption(d) | BoundedStorageError::Io(d) => {
+                        AdmittedReserveError::Storage(d)
+                    }
+                });
+            }
+        }
+
+        // Only after the durable ack: commit accounting and install the live entry
+        // (prechecked, allocation-free), then END the domain-guard scope before
+        // transferring the continuation coverage.
+        inner.reserved_positions = new_reserved;
+        inner.next_operation_id = next_operation_id;
+        inner.live.insert(
+            *position,
+            LiveState {
+                operation_id,
+                binding: *binding,
+                invoked: false,
+                result_acked: false,
+            },
+        );
+        drop(inner);
+
+        // Direct field move of the continuation coverage out of the workspace. The
+        // remaining partially-moved workspace (buffers + work_res) drops
+        // automatically in declaration order after this returns.
+        Ok(AdmittedReservationOutcome::FreshlyReserved(AdmittedContinuation {
+            inner: SigningContinuation {
+                domain_token: self.domain.token,
+                position: *position,
+                binding: *binding,
+                operation_id,
+            },
+            coverage: ws.cont_res,
+        }))
+    }
+
+    /// RUN 422 — admitted continuation consumption. Acquires the ownership domain
+    /// ONCE and routes the live-ownership transition through the shared
+    /// [`consume_live_locked`] (foreign-domain token checked FIRST, then an exact
+    /// un-invoked live match). On success it transfers the SAME continuation
+    /// coverage through consumption into the returned publication capability
+    /// WITHOUT release/recharge; on refusal nothing is mutated and the continuation
+    /// (with its coverage) is returned to the caller by dropping here.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn consume_for_signing_admitted(
+        &self,
+        cont: AdmittedContinuation,
+    ) -> Result<AdmittedPublicationCapability, AdmittedConsumeError> {
+        let mut inner = self
+            .domain
+            .inner
+            .lock()
+            .map_err(|_| AdmittedConsumeError::LockPoisoned)?;
+        consume_live_locked(
+            &mut inner,
+            self.domain.token,
+            cont.inner.domain_token,
+            &cont.inner.position,
+            &cont.inner.binding,
+            cont.inner.operation_id,
+        )?;
+        drop(inner);
+        // Transfer the SAME coverage through consumption (no release/recharge).
+        let AdmittedContinuation {
+            inner: sc,
+            coverage,
+        } = cont;
+        Ok(AdmittedPublicationCapability {
+            inner: ResultPublicationCapability {
+                domain_token: sc.domain_token,
+                position: sc.position,
+                binding: sc.binding,
+                operation_id: sc.operation_id,
+            },
+            coverage,
+        })
+    }
+
+    /// RUN 422 — admitted acknowledged-operation retirement. Delegates to the
+    /// completed [`retire_acknowledged_operation`](Self::retire_acknowledged_operation)
+    /// using the raw inner capability accessed ONLY inside this defining module.
+    /// The wrapper's owned coverage is untouched (retirement reserves and releases
+    /// nothing), so a still-held capability keeps covering its backing until it
+    /// drops.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn retire_admitted(
+        &self,
+        cap: &AdmittedPublicationCapability,
+    ) -> Result<RetirementOutcome, RetirementError> {
+        self.retire_acknowledged_operation(&cap.inner)
+    }
+
     /// Test-only: attach a handle over `store` WITHOUT establishing a limit, so
     /// the additive, read-only retained-retrieval path can be exercised against
     /// directly-written records. (The retrieval path takes no new reservation and
@@ -3071,28 +3606,29 @@ impl SigningReservationJournal {
         continuation: SigningContinuation,
     ) -> Result<ResultPublicationCapability, JournalError> {
         let mut inner = self.domain.inner.lock().map_err(|_| JournalError::LockPoisoned)?;
-        if continuation.domain_token != self.domain.token {
-            return Err(JournalError::InvalidResultPublication(
+        // Route the shared live-ownership transition through `consume_live_locked`
+        // and map its fixed codes back onto the UNCHANGED legacy `JournalError`
+        // strings, so the public behavior (including the exact diagnostic text) is
+        // preserved while the admitted route shares the identical check.
+        match consume_live_locked(
+            &mut inner,
+            self.domain.token,
+            continuation.domain_token,
+            &continuation.position,
+            &continuation.binding,
+            continuation.operation_id,
+        ) {
+            Ok(()) => Ok(ResultPublicationCapability {
+                domain_token: continuation.domain_token,
+                position: continuation.position,
+                binding: continuation.binding,
+                operation_id: continuation.operation_id,
+            }),
+            Err(AdmittedConsumeError::LockPoisoned) => Err(JournalError::LockPoisoned),
+            Err(AdmittedConsumeError::ForeignDomain) => Err(JournalError::InvalidResultPublication(
                 "signing continuation belongs to a foreign ownership domain".to_string(),
-            ));
-        }
-        match inner.live.get_mut(&continuation.position) {
-            Some(ls)
-                if ls.operation_id == continuation.operation_id
-                    && ls.binding == continuation.binding
-                    && !ls.invoked =>
-            {
-                ls.invoked = true;
-                Ok(ResultPublicationCapability {
-                    domain_token: continuation.domain_token,
-                    position: continuation.position,
-                    binding: continuation.binding,
-                    operation_id: continuation.operation_id,
-                })
-            }
-            // A live entry for a DIFFERENT operation (or an already-consumed one)
-            // must never be usurped by this continuation.
-            _ => Err(JournalError::InvalidResultPublication(
+            )),
+            Err(AdmittedConsumeError::NoFreshLiveOp) => Err(JournalError::InvalidResultPublication(
                 "no fresh live signing continuation owns this operation".to_string(),
             )),
         }
@@ -6770,4 +7306,4 @@ mod tests {
             "the surviving reservation is not re-signed into a live slot"
         );
     }
-}
+}
