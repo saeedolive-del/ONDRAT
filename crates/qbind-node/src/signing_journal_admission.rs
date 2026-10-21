@@ -632,16 +632,6 @@ impl AdmittedReserveWorkspace {
     pub(crate) fn is_cont_covered_by(&self, acct: &SharedAccountant) -> bool {
         self.cont_res.is_issued_by(acct)
     }
-
-    /// The charge held by the transient working-set reservation (observer).
-    pub(crate) fn work_charge(&self) -> u128 {
-        self.work_res.charge()
-    }
-
-    /// The charge held by the continuation reservation (observer).
-    pub(crate) fn cont_charge_held(&self) -> u128 {
-        self.cont_res.charge()
-    }
 }
 
 /// The compile-time charge admitted for the transient working set of one

@@ -895,7 +895,7 @@ pub(crate) struct AdmittedPublicationCapability {
 
 impl AdmittedPublicationCapability {
     /// The canonical position this capability publishes for.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn position(&self) -> SigningPosition {
         self.inner.position
     }
@@ -7304,6 +7304,631 @@ mod tests {
             journal.live_len_for_test(),
             0,
             "the surviving reservation is not re-signed into a live slot"
+        );
+    }
+
+    // =======================================================================
+    // RUN 422 — isolated admitted fresh-reservation route: envelope-capable,
+    // fault-injecting fixture and focused evidence tests.
+    //
+    // `EnvelopeModelStore` is the envelope-capable analogue of `ModelStore`: it
+    // SYNTHESIZES the outer storage checksum on read (so the admitted route's
+    // classification read observes both checksum layers), stores records
+    // record-only + metadata raw under one lock on the atomic envelope-pair
+    // write, and carries the `fail_writes` / `store_then_error` fault injectors
+    // plus `writes` / `record_writes` / `reads` counters so a test can observe a
+    // before-write refusal versus a write-then-error durable effect SEPARATELY.
+    // It provides NO power-loss durability.
+    // =======================================================================
+
+    #[derive(Default)]
+    struct EnvelopeModelStore {
+        map: Arc<RwLock<StdHashMap<Vec<u8>, Vec<u8>>>>,
+        fail_writes: RwLock<bool>,
+        store_then_error: RwLock<bool>,
+        reads: std::sync::atomic::AtomicUsize,
+        writes: std::sync::atomic::AtomicUsize,
+        record_writes: std::sync::atomic::AtomicUsize,
+        domain: std::sync::OnceLock<Arc<SigningOwnershipDomain>>,
+    }
+
+    impl EnvelopeModelStore {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn set_fail_writes(&self, v: bool) {
+            *self.fail_writes.write().unwrap() = v;
+        }
+        fn set_store_then_error(&self, v: bool) {
+            *self.store_then_error.write().unwrap() = v;
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[allow(dead_code)]
+        fn writes(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn record_writes(&self) -> usize {
+            self.record_writes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SigningJournalStorage for EnvelopeModelStore {
+        fn get_signing_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let m = self.map.read().unwrap();
+            match m.get(key) {
+                None => Ok(None),
+                Some(v) => {
+                    if v.len() > MAX_RECORD_LEN {
+                        return Err(StorageError::Corruption("record exceeds bound".to_string()));
+                    }
+                    Ok(Some(v.clone()))
+                }
+            }
+        }
+        fn put_signing_record_synced(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+            self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.map.write().unwrap().insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+        fn get_signing_metadata(&self) -> Result<Option<Vec<u8>>, StorageError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let m = self.map.read().unwrap();
+            Ok(m.get(MODEL_META_KEY).cloned())
+        }
+        fn put_signing_metadata_synced(&self, value: &[u8]) -> Result<(), StorageError> {
+            self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.map
+                .write()
+                .unwrap()
+                .insert(MODEL_META_KEY.to_vec(), value.to_vec());
+            Ok(())
+        }
+        fn put_signing_record_and_metadata_synced(
+            &self,
+            record_key: &[u8],
+            record_value: &[u8],
+            metadata_value: &[u8],
+        ) -> Result<(), StorageError> {
+            self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut m = self.map.write().unwrap();
+            m.insert(record_key.to_vec(), record_value.to_vec());
+            m.insert(MODEL_META_KEY.to_vec(), metadata_value.to_vec());
+            Ok(())
+        }
+        fn for_each_signing_namespace_entry(
+            &self,
+            visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<(), StorageError>,
+        ) -> Result<(), StorageError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let m = self.map.read().unwrap();
+            for (k, v) in m.iter() {
+                if k.as_slice() == MODEL_META_KEY {
+                    continue;
+                }
+                visitor(k, v)?;
+            }
+            Ok(())
+        }
+        fn signing_ownership_domain(&self) -> Arc<SigningOwnershipDomain> {
+            self.domain
+                .get_or_init(SigningOwnershipDomain::new)
+                .clone()
+        }
+        fn read_signing_envelope_into(
+            &self,
+            journal_key: &[u8],
+            dst: &mut [u8],
+        ) -> Result<Option<usize>, BoundedStorageError> {
+            use crate::signing_journal_admission::OUTER_CRC_LEN;
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let m = self.map.read().unwrap();
+            match m.get(journal_key) {
+                None => Ok(None),
+                Some(record) => {
+                    let total = OUTER_CRC_LEN + record.len();
+                    if total > dst.len() {
+                        return Err(BoundedStorageError::CapacityExceeded {
+                            stored_len: total,
+                            capacity: dst.len(),
+                        });
+                    }
+                    let crc = crate::storage::signing_journal_crc32(record);
+                    dst[..OUTER_CRC_LEN].copy_from_slice(&crc.to_be_bytes());
+                    dst[OUTER_CRC_LEN..total].copy_from_slice(record);
+                    Ok(Some(total))
+                }
+            }
+        }
+        fn reissue_signing_envelope_synced(
+            &self,
+            journal_key: &[u8],
+            envelope: &[u8],
+        ) -> Result<(), BoundedStorageError> {
+            use crate::signing_journal_admission::OUTER_CRC_LEN;
+            if envelope.len() < OUTER_CRC_LEN {
+                return Err(BoundedStorageError::Corruption(BoundedDiag::EnvelopeInvalid));
+            }
+            self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.map
+                .write()
+                .unwrap()
+                .insert(journal_key.to_vec(), envelope[OUTER_CRC_LEN..].to_vec());
+            Ok(())
+        }
+        fn put_signing_envelope_and_metadata_synced(
+            &self,
+            record_key: &[u8],
+            record_envelope: &[u8],
+            metadata_envelope: &[u8],
+        ) -> Result<(), BoundedStorageError> {
+            use crate::signing_journal_admission::OUTER_CRC_LEN;
+            self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Same fixed-framing preflight the durable/in-memory backends apply,
+            // BEFORE any fault branch, model-owned copy, or map mutation.
+            crate::storage::preflight_framed_envelope_pair(record_envelope, metadata_envelope)?;
+            if record_key.len() != crate::signing_journal_admission::JOURNAL_KEY_LEN {
+                return Err(BoundedStorageError::CapacityExceeded {
+                    stored_len: record_key.len(),
+                    capacity: crate::signing_journal_admission::JOURNAL_KEY_LEN,
+                });
+            }
+            // Fail BEFORE any write: neither value is mutated and record_writes is
+            // not advanced, so a test observes a before-write refusal distinctly.
+            if *self.fail_writes.read().unwrap() {
+                return Err(BoundedStorageError::Io(BoundedDiag::WriteIo));
+            }
+            let record_body = record_envelope[OUTER_CRC_LEN..].to_vec();
+            let metadata_body = metadata_envelope[OUTER_CRC_LEN..].to_vec();
+            // store_then_error: BOTH values become readable under one lock, but the
+            // durability acknowledgement is reported uncertain (error). record_writes
+            // is advanced so a test distinguishes write-then-error from before-write.
+            if *self.store_then_error.read().unwrap() {
+                self.record_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut m = self.map.write().unwrap();
+                m.insert(record_key.to_vec(), record_body);
+                m.insert(MODEL_META_KEY.to_vec(), metadata_body);
+                return Err(BoundedStorageError::Io(BoundedDiag::WriteIo));
+            }
+            self.record_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut m = self.map.write().unwrap();
+            m.insert(record_key.to_vec(), record_body);
+            m.insert(MODEL_META_KEY.to_vec(), metadata_body);
+            Ok(())
+        }
+    }
+
+    /// Build a real, established, associated, BOUNDED journal over the
+    /// envelope-capable fault-injecting fixture with durable limit `limit`, live
+    /// capacity `live_cap`, and operational/aggregate ceiling `cap`. Returns the
+    /// journal, its accountant handle, and the concrete store `Arc` (held so a
+    /// test can inject faults and read counters).
+    fn envelope_journal_with_limit(
+        limit: u64,
+        live_cap: usize,
+        cap: u128,
+    ) -> (SigningReservationJournal, SharedAccountant, Arc<EnvelopeModelStore>) {
+        let store = Arc::new(EnvelopeModelStore::new());
+        let journal = SigningReservationJournal::initialize(
+            store.clone() as Arc<dyn SigningJournalStorage>,
+            limit,
+        )
+        .expect("initialize envelope-capable backend");
+        let agg = AggregateAuthority::new();
+        agg.bind(cap).expect("bind aggregate ceiling");
+        let acct = SharedAccountant::new(agg);
+        acct.bind_cap(cap).expect("bind operational sub-ledger");
+        journal
+            .install_accountant_association(&acct)
+            .expect("install association");
+        journal
+            .enter_bounded_live_mode(live_cap)
+            .expect("enter bounded live mode");
+        (journal, acct, store)
+    }
+
+    fn envelope_journal(
+        live_cap: usize,
+        cap: u128,
+    ) -> (SigningReservationJournal, SharedAccountant, Arc<EnvelopeModelStore>) {
+        envelope_journal_with_limit(DEFAULT_MAX_RESERVED_POSITIONS, live_cap, cap)
+    }
+
+    /// Prerequisite refusals happen BEFORE any storage access: an unestablished
+    /// handle refuses `NotEstablished` and a legacy (non-bounded) established
+    /// handle refuses `NotBoundedMode` — in both cases no envelope read occurs.
+    #[test]
+    fn admitted_reserve_prerequisite_refusals_before_io() {
+        let _serial = bounded_serial();
+        // Unestablished: build an admitted-shaped workspace against a throwaway
+        // accountant and confirm NotEstablished with zero reads.
+        let store = Arc::new(EnvelopeModelStore::new());
+        let journal = SigningReservationJournal::attach_unestablished_for_test(
+            store.clone() as Arc<dyn SigningJournalStorage>,
+        );
+        let agg = AggregateAuthority::new();
+        agg.bind(1u128 << 40).unwrap();
+        let acct = SharedAccountant::new(agg);
+        acct.bind_cap(1u128 << 40).unwrap();
+        let ws = crate::signing_journal_admission::ReserveWorkspaceOwner::from_installed(
+            acct.clone(),
+        )
+        .admit()
+        .expect("admit workspace");
+        let reads_before = store.reads();
+        let p = position(SigningKind::Proposal, 1);
+        let b = binding(b"x");
+        assert_eq!(
+            journal.reserve_for_sign_admitted(&p, &b, ws).unwrap_err(),
+            AdmittedReserveError::NotEstablished
+        );
+        assert_eq!(store.reads(), reads_before, "no storage read before prereq");
+
+        // Established but LEGACY (never entered bounded mode): NotBoundedMode.
+        let (legacy, lacct, lstore) = {
+            let store = Arc::new(EnvelopeModelStore::new());
+            let journal = SigningReservationJournal::initialize(
+                store.clone() as Arc<dyn SigningJournalStorage>,
+                DEFAULT_MAX_RESERVED_POSITIONS,
+            )
+            .unwrap();
+            let agg = AggregateAuthority::new();
+            agg.bind(1u128 << 40).unwrap();
+            let acct = SharedAccountant::new(agg);
+            acct.bind_cap(1u128 << 40).unwrap();
+            journal.install_accountant_association(&acct).unwrap();
+            (journal, acct, store)
+        };
+        let ws = legacy.admit_reserve_workspace().expect("admit");
+        let reads_before = lstore.reads();
+        assert_eq!(
+            legacy.reserve_for_sign_admitted(&p, &b, ws).unwrap_err(),
+            AdmittedReserveError::NotBoundedMode
+        );
+        assert_eq!(lstore.reads(), reads_before, "no storage read before prereq");
+        let _ = lacct;
+    }
+
+    /// A workspace covered by a FOREIGN accountant is refused `ForeignWorkspace`
+    /// BEFORE any storage access, even on a fully-established bounded journal.
+    #[test]
+    fn admitted_reserve_foreign_workspace_refused_before_io() {
+        let _serial = bounded_serial();
+        let (journal, _acct, store) = envelope_journal(4, 1u128 << 40);
+        // A separate, foreign accountant funds a workspace that journal does not
+        // recognize as its installed ledger.
+        let fagg = AggregateAuthority::new();
+        fagg.bind(1u128 << 40).unwrap();
+        let facct = SharedAccountant::new(fagg);
+        facct.bind_cap(1u128 << 40).unwrap();
+        let foreign_ws =
+            crate::signing_journal_admission::ReserveWorkspaceOwner::from_installed(facct)
+                .admit()
+                .expect("admit foreign workspace");
+        let reads_before = store.reads();
+        let p = position(SigningKind::Proposal, 1);
+        let b = binding(b"x");
+        assert_eq!(
+            journal.reserve_for_sign_admitted(&p, &b, foreign_ws).unwrap_err(),
+            AdmittedReserveError::ForeignWorkspace
+        );
+        assert_eq!(store.reads(), reads_before, "no storage read before refusal");
+    }
+
+    /// Admission partial-rollback: when the continuation reservation cannot be
+    /// admitted, the working-set reservation is released (both ledgers unchanged),
+    /// and after the pressure is relieved an identical admission succeeds.
+    #[test]
+    fn admitted_workspace_partial_rollback_then_relief_retry() {
+        let _serial = bounded_serial();
+        use crate::signing_journal_admission::{cont_charge, reserve_work_charge};
+        // Enter bounded mode first to consume the container charge, then size the
+        // ceiling so that exactly ONE of work+cont fits after a small blocker.
+        let container = container_charge(1);
+        let headroom = reserve_work_charge() + cont_charge();
+        let cap = container + headroom;
+        let (journal, acct, _store) = envelope_journal(1, cap);
+        let used_after_container = acct.current();
+        assert_eq!(used_after_container, container, "only container charged so far");
+        // A blocker leaves room for the working-set reservation but not for the
+        // continuation reservation, so admission rolls the first back.
+        let blocker = acct.reserve(cont_charge()).expect("blocker reserves");
+        assert!(
+            journal.admit_reserve_workspace().is_err(),
+            "continuation admission refused under pressure"
+        );
+        assert_eq!(
+            acct.current(),
+            container + cont_charge(),
+            "rollback released the working-set reservation; only container + blocker remain"
+        );
+        // Relieve the pressure and retry: the identical admission now succeeds.
+        blocker.release_now();
+        let ws = journal
+            .admit_reserve_workspace()
+            .expect("admission succeeds after relief");
+        assert_eq!(
+            acct.current(),
+            container + reserve_work_charge() + cont_charge(),
+            "both coverages held after successful admission"
+        );
+        drop(ws);
+        assert_eq!(acct.current(), container, "workspace drop releases both coverages");
+    }
+
+    /// Fresh acknowledgement advances the durable counter, installs a live entry,
+    /// and returns a covered continuation whose coverage equals `cont_charge()`.
+    #[test]
+    fn admitted_fresh_reservation_acknowledged() {
+        let _serial = bounded_serial();
+        use crate::signing_journal_admission::cont_charge;
+        let (journal, acct, store) = envelope_journal(4, 1u128 << 40);
+        let p = position(SigningKind::Proposal, 1);
+        let b = binding(b"m");
+        let ws = journal.admit_reserve_workspace().expect("admit");
+        let record_writes_before = store.record_writes();
+        let outcome = journal.reserve_for_sign_admitted(&p, &b, ws).expect("ok");
+        let cont = match outcome {
+            AdmittedReservationOutcome::FreshlyReserved(c) => c,
+            other => panic!("expected FreshlyReserved, got {:?}", other),
+        };
+        assert_eq!(cont.position(), p);
+        assert!(cont.is_covered_by(&acct), "continuation covered by installed acct");
+        assert_eq!(cont.coverage_charge(), cont_charge(), "coverage == cont_charge()");
+        assert_eq!(journal.reserved_positions_for_test(), 1, "counter advanced");
+        assert_eq!(journal.live_len_for_test(), 1, "live entry installed");
+        assert_eq!(
+            store.record_writes(),
+            record_writes_before + 1,
+            "exactly one durable envelope-pair write"
+        );
+    }
+
+    /// Existing-position classification is NON-delivering: a durable `Reserved`
+    /// record classifies as `ReservedPotentiallySigned`, and a different binding
+    /// at the same position classifies as `Conflict`.
+    #[test]
+    fn admitted_existing_position_classification() {
+        let _serial = bounded_serial();
+        let (journal, _acct, _store) = envelope_journal(4, 1u128 << 40);
+        let p = position(SigningKind::Proposal, 2);
+        let b = binding(b"first");
+        let ws = journal.admit_reserve_workspace().unwrap();
+        let _ = journal.reserve_for_sign_admitted(&p, &b, ws).unwrap();
+        // Same position + same binding: existing durable Reserved record.
+        let ws = journal.admit_reserve_workspace().unwrap();
+        assert!(matches!(
+            journal.reserve_for_sign_admitted(&p, &b, ws).unwrap(),
+            AdmittedReservationOutcome::ReservedPotentiallySigned
+        ));
+        // Same position + DIFFERENT binding: conflict.
+        let ws = journal.admit_reserve_workspace().unwrap();
+        assert!(matches!(
+            journal
+                .reserve_for_sign_admitted(&p, &binding(b"second"), ws)
+                .unwrap(),
+            AdmittedReservationOutcome::Conflict
+        ));
+    }
+
+    /// Capacity exhaustion: the durable journal-wide limit yields `Exhausted`;
+    /// a full bounded live container yields `LiveCapacityExhausted`.
+    #[test]
+    fn admitted_capacity_exhaustion() {
+        let _serial = bounded_serial();
+        // Durable limit 1: the second DISTINCT fresh position is Exhausted.
+        {
+            let (journal, _acct, _store) = envelope_journal_with_limit(1, 1, 1u128 << 40);
+            let ws = journal.admit_reserve_workspace().unwrap();
+            let _ = journal
+                .reserve_for_sign_admitted(&position(SigningKind::Proposal, 1), &binding(b"a"), ws)
+                .unwrap();
+            let ws = journal.admit_reserve_workspace().unwrap();
+            assert!(matches!(
+                journal
+                    .reserve_for_sign_admitted(&position(SigningKind::Proposal, 2), &binding(b"b"), ws)
+                    .unwrap(),
+                AdmittedReservationOutcome::Exhausted
+            ));
+        }
+        // Live capacity 1 (limit large): with one un-retired live op, a second
+        // fresh position is refused LiveCapacityExhausted.
+        {
+            let (journal, _acct, _store) = envelope_journal_with_limit(1_000, 1, 1u128 << 40);
+            let ws = journal.admit_reserve_workspace().unwrap();
+            let _ = journal
+                .reserve_for_sign_admitted(&position(SigningKind::Proposal, 1), &binding(b"a"), ws)
+                .unwrap();
+            let ws = journal.admit_reserve_workspace().unwrap();
+            assert!(matches!(
+                journal
+                    .reserve_for_sign_admitted(&position(SigningKind::Proposal, 2), &binding(b"b"), ws)
+                    .unwrap(),
+                AdmittedReservationOutcome::LiveCapacityExhausted
+            ));
+        }
+    }
+
+    /// A before-write failure advances NO durable record and NO counter but
+    /// latches accounting uncertain; a write-then-error advances the durable
+    /// record write yet still no counter — both observed SEPARATELY via the
+    /// `record_writes` counter — and subsequent admitted calls stay blocked
+    /// (`AccountingUncertain`) without implicit legacy reconciliation.
+    #[test]
+    fn admitted_before_write_vs_write_then_error() {
+        let _serial = bounded_serial();
+        // Fail BEFORE write.
+        {
+            let (journal, _acct, store) = envelope_journal(4, 1u128 << 40);
+            store.set_fail_writes(true);
+            let ws = journal.admit_reserve_workspace().unwrap();
+            let p = position(SigningKind::Proposal, 1);
+            let b = binding(b"m");
+            assert_eq!(
+                journal.reserve_for_sign_admitted(&p, &b, ws).unwrap_err(),
+                AdmittedReserveError::Storage(BoundedDiag::WriteIo)
+            );
+            assert_eq!(store.record_writes(), 0, "no durable record write");
+            assert_eq!(journal.reserved_positions_for_test(), 0, "counter not advanced");
+            store.set_fail_writes(false);
+            // Blocked thereafter, with no implicit reconciliation.
+            let ws = journal.admit_reserve_workspace().unwrap();
+            assert!(matches!(
+                journal.reserve_for_sign_admitted(&p, &b, ws).unwrap(),
+                AdmittedReservationOutcome::AccountingUncertain
+            ));
+        }
+        // STORE then error: durable record write observed, counter still unmoved.
+        {
+            let (journal, _acct, store) = envelope_journal(4, 1u128 << 40);
+            store.set_store_then_error(true);
+            let ws = journal.admit_reserve_workspace().unwrap();
+            let p = position(SigningKind::Proposal, 1);
+            let b = binding(b"m");
+            assert_eq!(
+                journal.reserve_for_sign_admitted(&p, &b, ws).unwrap_err(),
+                AdmittedReserveError::Storage(BoundedDiag::WriteIo)
+            );
+            assert_eq!(store.record_writes(), 1, "durable record write DID land");
+            assert_eq!(journal.reserved_positions_for_test(), 0, "counter not advanced");
+            store.set_store_then_error(false);
+            let ws = journal.admit_reserve_workspace().unwrap();
+            assert!(matches!(
+                journal.reserve_for_sign_admitted(&p, &b, ws).unwrap(),
+                AdmittedReservationOutcome::AccountingUncertain
+            ));
+        }
+    }
+
+    /// Two real journal domains with the SAME position/binding/operation-id: a
+    /// continuation from domain A, handed to domain B's admitted consume, is
+    /// refused `ForeignDomain` BEFORE either live state changes — proved by both
+    /// legitimate consumptions still succeeding afterwards.
+    #[test]
+    fn admitted_foreign_continuation_refused_before_live_change() {
+        let _serial = bounded_serial();
+        let (ja, _aa, _sa) = envelope_journal(4, 1u128 << 40);
+        let (jb, _ab, _sb) = envelope_journal(4, 1u128 << 40);
+        let p = position(SigningKind::Proposal, 1);
+        let b = binding(b"same");
+        // A: fresh continuation.
+        let ws = ja.admit_reserve_workspace().unwrap();
+        let cont_a = match ja.reserve_for_sign_admitted(&p, &b, ws).unwrap() {
+            AdmittedReservationOutcome::FreshlyReserved(c) => c,
+            other => panic!("A expected FreshlyReserved, got {:?}", other),
+        };
+        // B: fresh continuation for the SAME position/binding/operation-id.
+        let ws = jb.admit_reserve_workspace().unwrap();
+        let cont_b = match jb.reserve_for_sign_admitted(&p, &b, ws).unwrap() {
+            AdmittedReservationOutcome::FreshlyReserved(c) => c,
+            other => panic!("B expected FreshlyReserved, got {:?}", other),
+        };
+        // A's continuation is foreign to B: refused before B's live entry changes.
+        assert_eq!(
+            jb.consume_for_signing_admitted(cont_a)
+                .err()
+                .expect("foreign refused"),
+            AdmittedConsumeError::ForeignDomain
+        );
+        // Neither live state was disturbed: both legitimate consumptions succeed.
+        assert!(
+            jb.consume_for_signing_admitted(cont_b).is_ok(),
+            "B's own fresh continuation still consumable"
+        );
+    }
+
+    /// Continuous coverage: the continuation keeps its coverage after the rest of
+    /// the workspace drops, carries it UNCHANGED through consumption into the
+    /// publication capability (no release/recharge), and releases it only when the
+    /// wrapper finally drops — retirement in between preserves that coverage.
+    #[test]
+    fn admitted_coverage_persists_through_consumption_and_retirement() {
+        let _serial = bounded_serial();
+        use crate::signing_journal_admission::cont_charge;
+        let (journal, acct, _store) = envelope_journal(4, 1u128 << 40);
+        let container = container_charge(4);
+        assert_eq!(acct.current(), container, "only the container is charged initially");
+        let p = position(SigningKind::Proposal, 1);
+        let b = binding(b"m");
+        let ws = journal.admit_reserve_workspace().unwrap();
+        let cont = match journal.reserve_for_sign_admitted(&p, &b, ws).unwrap() {
+            AdmittedReservationOutcome::FreshlyReserved(c) => c,
+            other => panic!("expected FreshlyReserved, got {:?}", other),
+        };
+        // The workspace (and its working-set coverage) has dropped, but the
+        // continuation's coverage persists.
+        assert_eq!(
+            acct.current(),
+            container + cont_charge(),
+            "continuation coverage persists after workspace cleanup"
+        );
+        // Consumption transfers the SAME coverage with no release/recharge.
+        let cap = journal.consume_for_signing_admitted(cont).expect("consume");
+        assert_eq!(
+            acct.current(),
+            container + cont_charge(),
+            "coverage unchanged across consumption (no release/recharge)"
+        );
+        assert_eq!(cap.coverage_charge(), cont_charge());
+        assert!(cap.is_covered_by(&acct));
+        // Drive the live op to acknowledged so retirement is accepted, WITHOUT
+        // disturbing the wrapper's coverage. The test module can access the raw
+        // inner capability to publish through the legacy checked path.
+        journal
+            .record_signed_result(&cap.inner, b"sig")
+            .expect("record signed result");
+        assert!(journal.retire_admitted(&cap).is_ok(), "retire acknowledged op");
+        assert_eq!(
+            acct.current(),
+            container + cont_charge(),
+            "retirement preserves the wrapper's coverage"
+        );
+        // Final release happens only on wrapper drop.
+        drop(cap);
+        assert_eq!(acct.current(), container, "wrapper drop releases the coverage");
+    }
+
+    #[test]
+    fn admitted_measured_layout_operands() {
+        // Source-derived layout evidence: report the ACTUAL `size_of` operands of
+        // the conservative working-set and continuation-coverage charges on the
+        // host toolchain, and assert the internal relations the charge formulas
+        // rely on. These are structural sizes (read via `core::mem::size_of`),
+        // NOT measured physical stack usage.
+        use crate::signing_journal_admission::{
+            cont_charge, reserve_work_charge, AdmittedReserveWorkspace, BACKEND_KEY_LEN,
+            META_ENVELOPE_LEN, RESERVED_ENVELOPE_LEN,
+        };
+        let aw = core::mem::size_of::<AdmittedReserveWorkspace>();
+        let brv = core::mem::size_of::<BorrowedRecordView<'static>>();
+        let cont = core::mem::size_of::<AdmittedContinuation>();
+        let ret =
+            core::mem::size_of::<Result<AdmittedReservationOutcome, AdmittedReserveError>>();
+        let pubret = core::mem::size_of::<
+            Result<AdmittedPublicationCapability, AdmittedConsumeError>,
+        >();
+        let conv = cont + pubret;
+        eprintln!(
+            "ADMITTED_LAYOUT size_of: AdmittedReserveWorkspace={} BorrowedRecordView={} \
+             AdmittedContinuation={} ReserveReturn={} PublishReturn={} \
+             RESERVED_ENVELOPE_LEN={} META_ENVELOPE_LEN={} reserve_work_charge={} \
+             cont_charge={} (conv={})",
+            aw, brv, cont, ret, pubret, RESERVED_ENVELOPE_LEN, META_ENVELOPE_LEN,
+            reserve_work_charge(), cont_charge(), conv,
+        );
+        // The continuation coverage is the conservative MAX over the reservation
+        // return and the continuation-to-publication conversion representations;
+        // the conversion owns no additional covered object beyond those.
+        assert_eq!(cont_charge(), core::cmp::max(ret, conv) as u128);
+        // The working-set charge dominates every working buffer it must cover.
+        assert!(
+            reserve_work_charge()
+                >= (aw + BACKEND_KEY_LEN + brv + core::mem::size_of::<u32>()
+                    + RESERVED_ENVELOPE_LEN + META_ENVELOPE_LEN) as u128
         );
     }
 }
