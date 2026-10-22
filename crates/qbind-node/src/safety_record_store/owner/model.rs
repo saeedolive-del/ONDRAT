@@ -27,7 +27,12 @@ use crate::signing_reservation_journal::{
     SigningContinuation, SigningKind, SigningPosition, SigningReservationJournal,
 };
 use crate::signing_reservation_journal::{RefuseReason, RetainedDelivery};
+use crate::signing_reservation_journal::{
+    AdmittedPublishError, AdmittedPublishOutcome, AdmittedReservationOutcome, AdmittedReserveError,
+    BoundedDiag, RetirementOutcome,
+};
 use crate::signing_journal_admission::RetrievalWorkspaceOwner;
+use crate::validator_signer::ValidatorSigner;
 
 use super::super::decision_capture::{
     OwningCapturePayload, PreparedDecisionInputLimits, RetainedDecisionObservation,
@@ -1562,6 +1567,622 @@ fn retained_vote_use_model<H: CommittedHistory + ?Sized>(
     //     destroyed by reverse-drop order after this returns (guard LAST).
     let diag = sink.consume_verified(vote, retrieved, preimage_len);
     ModelRetainedUseOutcome::Consumed(diag)
+}
+
+// ===========================================================================
+// RUN 422 — Isolated ADMITTED REAL fresh-vote signing composition (TEST-ONLY).
+//
+// A third sibling model alongside `fresh_vote_sign_model` (legacy journal route,
+// bounded FIXTURE signer, model-owned Vote clone with a permitted suite
+// reassignment) and `retained_vote_use_model` (checked retrieval of an
+// already-retained signature). This one BORROWS `decided.vote()` unchanged, uses
+// the REAL caller-buffer `LocalKeySigner` ML-DSA-44 path, and drives the ADMITTED
+// journal reservation/consumption/publication route under ONE safety-domain
+// guard, finishing with an acknowledged journal publication, a single bounded
+// publication retry policy, one post-acknowledgement retirement attempt, and a
+// fixed-size scalar diagnostic. Nothing is wired into any production caller; it
+// establishes no signing permission, freshness, or network-ready signed Vote.
+//
+// Suite note (isolation-honest): the engine stamps the self-vote's wire
+// `suite_id` at `DEFAULT_CONSENSUS_SUITE_ID` (0), while the real `LocalKeySigner`
+// and its ML-DSA-44 backend intrinsically require the signing suite 100. This
+// model does NOT rewrite the borrowed Vote (unlike the production-mirroring
+// `fresh_vote_sign_model`), so it enforces the signer<->authorized-key<->backend
+// agreement at the signer's suite (100) while the canonical preimage/binding are
+// derived verbatim from the borrowed Vote's OWN fields (wire suite 0). The result
+// is therefore a test-only composition over the borrowed Vote's canonical body,
+// NOT a network-ready signed Vote; the wire-suite-vs-signing-suite equality that
+// production establishes by reassigning the suite is NOT claimed here.
+// ===========================================================================
+
+/// The result of the single post-acknowledgement retirement attempt. Reported
+/// SEPARATELY from the publication acknowledgement: a retirement failure never
+/// erases or relabels a `Published` acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetirementReport {
+    /// `retire_admitted` acknowledged in-memory live-entry retirement.
+    Retired,
+    /// `retire_admitted` refused; the publication acknowledgement still stands.
+    Failed,
+}
+
+/// Fixed-size, `Copy` diagnostic for the real-signer composition. It copies ONLY
+/// scalar fields out of the borrowed Vote plus the signature/preimage LENGTHS,
+/// whether exactly one bounded publication retry occurred, and the separate
+/// retirement result — never the signature bytes, never an owned Vote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RealSignDiag {
+    pub(crate) validator_index: u64,
+    pub(crate) height: u64,
+    pub(crate) round: u64,
+    pub(crate) step: u8,
+    /// The BORROWED Vote's own wire suite (not rewritten; see the suite note).
+    pub(crate) suite_id: u16,
+    pub(crate) sig_len: u32,
+    pub(crate) preimage_len: u32,
+    /// True iff exactly one bounded `Storage(WriteIo)` publication retry occurred.
+    pub(crate) republished: bool,
+    pub(crate) retirement: RetirementReport,
+}
+
+/// The concrete recording sink for the real-signer composition: no callback, no
+/// Vote return, no signature copy/retain. It records only the fixed scalar
+/// diagnostic and a call count.
+pub(crate) struct RealSignRecordingSink {
+    pub(crate) last: Option<RealSignDiag>,
+    pub(crate) calls: u32,
+}
+
+impl RealSignRecordingSink {
+    pub(crate) fn new() -> Self {
+        Self { last: None, calls: 0 }
+    }
+
+    /// Copy only fixed scalars out of `vote` plus the lengths and the bounded
+    /// retry/retirement outcomes; never clone or retain signature bytes.
+    fn record(
+        &mut self,
+        vote: &Vote,
+        sig_len: usize,
+        preimage_len: usize,
+        republished: bool,
+        retirement: RetirementReport,
+    ) -> RealSignDiag {
+        let diag = RealSignDiag {
+            validator_index: vote.validator_index as u64,
+            height: vote.height,
+            round: vote.round,
+            step: vote.step,
+            suite_id: vote.suite_id,
+            sig_len: sig_len as u32,
+            preimage_len: preimage_len as u32,
+            republished,
+            retirement,
+        };
+        self.calls = self.calls.saturating_add(1);
+        self.last = Some(diag);
+        diag
+    }
+}
+
+// ===========================================================================
+// Typed outcome (fixed-size; never forwards an owned String).
+// ===========================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RealFreshSignOutcome {
+    /// Acknowledged journal publication; carries the fixed-size diagnostic.
+    Published(RealSignDiag),
+    PolicyRefused,
+    // Signer output-bound pre-checks (before the safety domain / any journal op).
+    SignerBoundUnsupported,
+    OutputCapacityRefused,
+    ProfileRefused,
+    // Authorization / observation / lifecycle under the guard.
+    AuthorizationAdmitRefused,
+    ObservationRefused,
+    LifecycleAmbiguous,
+    // Exact-Vote eligibility.
+    SignedInputRejected,
+    MembershipRefused,
+    WrongWireChain,
+    WrongAuthorizedEpoch,
+    SuiteMismatch,
+    KeyUnavailable,
+    BackendUnavailable,
+    // Resource admission (isolated, before any journal reservation/consumption).
+    WorkSetAdmitRefused,
+    CryptoAdmitRefused,
+    OutputAdmitRefused,
+    ReserveWorkspaceAdmitRefused,
+    PublishWorkspaceAdmitRefused,
+    // Admitted reservation classification (every existing-position class is
+    // non-delivering in this helper).
+    ReserveConflict,
+    ReservePotentiallySigned,
+    ReserveExhausted,
+    ReserveLiveCapacityExhausted,
+    ReserveWorkspaceCapacityExceeded,
+    ReserveAccountingUncertain,
+    ReserveStorage,
+    ReserveFailed,
+    // Consumption / original-ticket confirmation.
+    ConsumeFailed,
+    AuthorizationConfirmRefused,
+    // Signer faults / returned-length validation.
+    SignerFailed,
+    EmptyWritten,
+    OversizeWritten,
+    WrongLength,
+    // Publication faults (after at most one bounded WriteIo retry).
+    PublishReadIo,
+    PublishWriteIo,
+    PublishDifferentResultRefused,
+    PublishReservedForeignBinding,
+    PublishPositionMismatch,
+    PublishMalformedRecord,
+    PublishNoRecord,
+    PublishFailed,
+}
+
+// ===========================================================================
+// Real-signer invocation COUNTER (delegates to any `&dyn ValidatorSigner`).
+//
+// It counts ACTUAL `sign_vote_into` calls at the real signing boundary
+// (incremented BEFORE delegating, so a call that returns an error is still
+// counted) and forwards every other trait method unchanged. `AtomicU32` keeps the
+// wrapper `Send + Sync` (the `ValidatorSigner` supertrait requirement). It is a
+// caller-owned fixture; it is NOT part of the composition's charged working set.
+// ===========================================================================
+pub(crate) struct CountingValidatorSigner<'a> {
+    inner: &'a dyn ValidatorSigner,
+    calls: std::sync::atomic::AtomicU32,
+}
+
+impl<'a> CountingValidatorSigner<'a> {
+    pub(crate) fn new(inner: &'a dyn ValidatorSigner) -> Self {
+        Self {
+            inner,
+            calls: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// The exact number of `sign_vote_into` invocations observed at the boundary.
+    pub(crate) fn calls(&self) -> u32 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ValidatorSigner for CountingValidatorSigner<'_> {
+    fn validator_id(&self) -> &ValidatorId {
+        self.inner.validator_id()
+    }
+    fn suite_id(&self) -> u16 {
+        self.inner.suite_id()
+    }
+    fn sign_proposal(&self, preimage: &[u8]) -> Result<Vec<u8>, crate::validator_signer::SignError> {
+        self.inner.sign_proposal(preimage)
+    }
+    fn sign_vote(&self, preimage: &[u8]) -> Result<Vec<u8>, crate::validator_signer::SignError> {
+        self.inner.sign_vote(preimage)
+    }
+    fn sign_timeout(
+        &self,
+        view: u64,
+        high_qc: Option<&qbind_consensus::qc::QuorumCertificate<[u8; 32]>>,
+    ) -> Result<Vec<u8>, crate::validator_signer::SignError> {
+        self.inner.sign_timeout(view, high_qc)
+    }
+    fn sign_timeout_with_chain_id(
+        &self,
+        chain_id: qbind_types::ChainId,
+        view: u64,
+        high_qc: Option<&qbind_consensus::qc::QuorumCertificate<[u8; 32]>>,
+    ) -> Result<Vec<u8>, crate::validator_signer::SignError> {
+        self.inner
+            .sign_timeout_with_chain_id(chain_id, view, high_qc)
+    }
+    fn signature_output_bound(&self) -> Result<usize, crate::validator_signer::BoundedSignError> {
+        self.inner.signature_output_bound()
+    }
+    fn sign_vote_into(
+        &self,
+        preimage: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, crate::validator_signer::BoundedSignError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.sign_vote_into(preimage, out)
+    }
+}
+
+// ===========================================================================
+// Accounting charges for the real-signer composition.
+// ===========================================================================
+
+/// The composition's OWN signing working set (RUN 422 §5), mirroring the retained
+/// `verify_charge` inventory: the owned public-key lookup `Vec` (control +
+/// conservative backing), the preimage `Vec` (control + backing), the SEPARATE
+/// canonical-body temporary `Vec` built inside `vote_preimage` (control +
+/// backing), and the fixed-size position / binding-input / hashing / binding
+/// objects. It does NOT cover the admitted output, reservation workspace,
+/// continuation, publication workspace, or the crypto temporaries — each of those
+/// is charged by its own reservation and must not be double-counted here.
+fn real_sign_work_charge() -> u128 {
+    let pubkey_control = std::mem::size_of::<Vec<u8>>() as u128;
+    let pubkey_backing = MODEL_MAX_PUBKEY_BYTES;
+    let preimage_control = std::mem::size_of::<Vec<u8>>() as u128;
+    let preimage_backing = MODEL_MAX_PREIMAGE_BYTES;
+    let canonical_body_control = std::mem::size_of::<Vec<u8>>() as u128;
+    let canonical_body_temp = MODEL_MAX_PREIMAGE_BYTES;
+    let position = std::mem::size_of::<SigningPosition>() as u128;
+    let binding_input = std::mem::size_of::<DecisionBindingInput<'static>>() as u128;
+    let sha3 = std::mem::size_of::<Sha3_256>() as u128;
+    let binding_digest = std::mem::size_of::<BindingDigest>() as u128;
+    pubkey_control
+        .saturating_add(pubkey_backing)
+        .saturating_add(preimage_control)
+        .saturating_add(preimage_backing)
+        .saturating_add(canonical_body_control)
+        .saturating_add(canonical_body_temp)
+        .saturating_add(position)
+        .saturating_add(binding_input)
+        .saturating_add(sha3)
+        .saturating_add(binding_digest)
+}
+
+/// Crypto-temporary coverage (RUN 422 §5), admitted BEFORE the admitted journal
+/// reservation and retained across the signer call. Derived from the ACTUAL owned
+/// temporaries inside `MlDsa44Backend::sign_into`: the copied secret-key array
+/// (`ML_DSA_44_SECRET_KEY_SIZE`), the decoded `fips204::ml_dsa_44::PrivateKey`
+/// object (`ML_DSA_44_PRIVATE_KEY_OBJECT_BYTES`, exported RUN 422 D7 — never the
+/// hard-coded 12,416-byte evaluation), and the fixed signature array
+/// (`ML_DSA_44_SIGNATURE_SIZE`). Dependency-internal scratch, allocator overhead,
+/// and physical stack are OUTSIDE this source-derived charge boundary; this is not
+/// a process-memory bound.
+fn crypto_temp_charge() -> u128 {
+    (qbind_crypto::ml_dsa44::ML_DSA_44_SECRET_KEY_SIZE as u128)
+        .saturating_add(qbind_crypto::ML_DSA_44_PRIVATE_KEY_OBJECT_BYTES as u128)
+        .saturating_add(qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE as u128)
+}
+
+/// RUN 422 — the isolated protected ADMITTED REAL fresh-vote signing composition.
+/// ONE ordered protected sequence under a SINGLE serialization-domain guard
+/// acquired FIRST (dropped LAST). It borrows `decided.vote()` exclusively, signs
+/// it once through the real caller-buffer `LocalKeySigner`, publishes through the
+/// admitted journal route, and finishes with a fixed-size scalar diagnostic plus a
+/// separate retirement result. No production caller, no legacy allocating signer
+/// fallback, no network delivery.
+#[allow(clippy::too_many_arguments)]
+fn fresh_vote_sign_real_local<H: CommittedHistory + ?Sized>(
+    owner: &SafetyRecordOwner,
+    engine: &qbind_consensus::BasicHotStuffEngine<[u8; 32]>,
+    decided: &qbind_consensus::DecidedVote<OwningCapturePayload>,
+    proposal: &qbind_wire::consensus::BlockProposal,
+    limits: &PreparedDecisionInputLimits,
+    history: Option<&H>,
+    snapshot: &mut AuthorizedProposalVoteSnapshot,
+    signer: &dyn ValidatorSigner,
+    sink: &mut RealSignRecordingSink,
+    journal: &SigningReservationJournal,
+    coord: &mut ModelCoordinationHook,
+    reconfirm: ReconfirmPerturbation,
+) -> RealFreshSignOutcome {
+    use crate::genesis_consensus_authority::LocalAuthorizationState;
+
+    // 1. Owner-derived policy BEFORE acquiring the safety domain (no allocation).
+    match PreparedDecisionInputLimits::from_pinned(owner.pinned()) {
+        Ok(expected) => {
+            if *limits != expected {
+                return RealFreshSignOutcome::PolicyRefused;
+            }
+        }
+        Err(_) => return RealFreshSignOutcome::PolicyRefused,
+    }
+
+    // The ONLY Vote used throughout: borrowed from the owning envelope. No clone,
+    // no suite reassignment, no signature assignment.
+    let vote: &Vote = decided.vote();
+
+    // 2. Establish the checked signer output bound BEFORE any irreversible work
+    //    and BEFORE acquiring the safety domain. Query it exactly once and retain
+    //    the checked value. OUTPUT_CAP == ML_DSA_44_SIGNATURE_SIZE here, so an
+    //    over-capacity bound is an output-capacity refusal and any other mismatch
+    //    is a profile refusal.
+    let bound = match signer.signature_output_bound() {
+        Ok(b) => b,
+        Err(_) => return RealFreshSignOutcome::SignerBoundUnsupported,
+    };
+    if bound > crate::signing_journal_admission::OUTPUT_CAP {
+        return RealFreshSignOutcome::OutputCapacityRefused;
+    }
+    if bound != qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE {
+        return RealFreshSignOutcome::ProfileRefused;
+    }
+
+    // 3. Acquire the serialization domain ONCE and FIRST so it is released LAST.
+    let guard = owner.backend.lock_domain();
+
+    // 4. Admit control coverage BEFORE constructing the ticket; obtain the
+    //    ORIGINAL authorization ticket.
+    let _control_res = match owner.backend.accounting().reserve(control_charge()) {
+        Ok(r) => r,
+        Err(_) => return RealFreshSignOutcome::AuthorizationAdmitRefused,
+    };
+    let ticket = match snapshot.owner().admit() {
+        Ok(t) => t,
+        Err(_) => return RealFreshSignOutcome::AuthorizationAdmitRefused,
+    };
+
+    // 5. Existing non-consuming held-guard observation (locked-only; SafeNoLock is
+    //    NOT admitted). Does not reacquire the domain.
+    match owner.observe_checks_locked(&guard, engine, decided, proposal, limits, history) {
+        RetainedDecisionObservation::Revalidated(
+            BoundedSafetyOutcome::SafeViewSufficiency | BoundedSafetyOutcome::SafeAncestry { .. },
+        ) => {}
+        _ => return RealFreshSignOutcome::ObservationRefused,
+    }
+
+    // 6. Conservative captured-versus-current lifecycle agreement UNDER THE SAME
+    //    guard, in its separately charged scope. The validated record (carrying its
+    //    own loader holder reservation) and the lifecycle scalars are destroyed
+    //    BEFORE the covering reservation releases.
+    let lifecycle = (|| -> Option<()> {
+        let lifecycle_res = owner
+            .backend
+            .accounting()
+            .reserve(lifecycle_charge())
+            .ok()?;
+        let agree = {
+            let validated: ValidatedRecord =
+                owner.load_current_validated_locked(&guard, history).ok()?;
+            let current_identity = GenerationIdentity::from_retained(validated.retained())?;
+            let current_revision = owner.authoritative_revision_locked(&guard).ok()?;
+            let captured: PreparedProvenance = owner
+                .pin_provenance_locked(&guard, decided.payload().pin())
+                .ok()?;
+            let (engine_lock_id, engine_lock_view) = match engine.locked_qc() {
+                Some(qc) => (qc.block_id, qc.view),
+                None => return None,
+            };
+            captured.identity == current_identity
+                && captured.captured_revision == current_revision
+                && captured.recovery_backend_incarnation == owner.backend.incarnation()
+                && engine_lock_id == current_identity.lock_block_id
+                && engine_lock_view == current_identity.lock_view
+        };
+        drop(lifecycle_res);
+        agree.then_some(())
+    })();
+    if lifecycle.is_none() {
+        return RealFreshSignOutcome::LifecycleAmbiguous;
+    }
+
+    // 7. Exact-Vote eligibility on the BORROWED Vote, before admitting the
+    //    composition working set. Unsigned-input precondition first (the owning
+    //    envelope's Vote carries no inline signature; this is a control-flow
+    //    refusal, not just an assertion).
+    if !vote.signature.is_empty() {
+        return RealFreshSignOutcome::SignedInputRejected;
+    }
+    let bound_id = ValidatorId::new(vote.validator_index as u64);
+    if *signer.validator_id() != bound_id || !snapshot.verifier().validators.contains(bound_id) {
+        return RealFreshSignOutcome::MembershipRefused;
+    }
+    if vote.chain_id != snapshot.verifier().signing_domain.expected_wire_chain_id() {
+        return RealFreshSignOutcome::WrongWireChain;
+    }
+    if vote.epoch != snapshot.authorized_epoch() {
+        return RealFreshSignOutcome::WrongAuthorizedEpoch;
+    }
+
+    // 8. Admit the composition working set BEFORE constructing any covered object.
+    let release_probe = current_release_probe();
+    let work_res_inner = match owner.backend.accounting().reserve(real_sign_work_charge()) {
+        Ok(r) => r,
+        Err(_) => return RealFreshSignOutcome::WorkSetAdmitRefused,
+    };
+    let _work_res =
+        TrackedReservation::new(work_res_inner, release_probe.clone(), "work_res_release");
+
+    // 9. Signer<->authorized-key<->backend agreement at the SIGNER's suite (100),
+    //    and canonical preimage/binding derived VERBATIM from the borrowed Vote's
+    //    OWN fields (no suite rewrite). Covered objects are returned into function
+    //    scope so they are destroyed before `work_res` releases.
+    let (position, binding, owned_pk_vec, preimage_vec, preimage_len) = {
+        let ctx: &ProposalVoteAuthority = snapshot.verifier();
+        let owned_pk = match ctx.key_provider.get_suite_and_key(bound_id) {
+            Some((gov_suite, pk)) => {
+                if gov_suite != ConsensusSigSuiteId::new(signer.suite_id()) {
+                    return RealFreshSignOutcome::SuiteMismatch;
+                }
+                if ctx.backend_registry.get_backend(gov_suite).is_none() {
+                    return RealFreshSignOutcome::BackendUnavailable;
+                }
+                pk
+            }
+            None => return RealFreshSignOutcome::KeyUnavailable,
+        };
+        debug_assert!(
+            owned_pk.capacity() as u128 <= MODEL_MAX_PUBKEY_BYTES,
+            "owned public-key backing capacity exceeded the reserved bound"
+        );
+        let preimage = ctx.signing_domain.vote_preimage(vote);
+        debug_assert!(
+            preimage.capacity() as u128 <= MODEL_MAX_PREIMAGE_BYTES,
+            "model preimage backing capacity exceeded the reserved bound"
+        );
+        let position = SigningPosition {
+            validator_id: vote.validator_index as u64,
+            network_genesis: *ctx.signing_domain.genesis_identity(),
+            kind: SigningKind::Vote,
+            originating_view: vote.height,
+        };
+        let binding = BindingDigest::compute(&DecisionBindingInput {
+            position,
+            authorized_epoch: vote.epoch,
+            suite_id: vote.suite_id,
+            wire_message_version: vote.version as u16,
+            d6_signing_format_version: MODEL_D6_SIGNING_FORMAT_VERSION,
+            authority_commitment: *ctx.signing_domain.authority_commitment(),
+            block_id: vote.block_id,
+            canonical_preimage: &preimage,
+        });
+        let preimage_len = preimage.len();
+        (position, binding, owned_pk, preimage, preimage_len)
+    };
+    // Wrap the ACTUAL owned backings so their destruction is observed relative to
+    // the covering `work_res` release (declared AFTER it ⇒ dropped before it).
+    let _owned_pk = TrackedBacking::new(owned_pk_vec, release_probe.clone(), "owned_pk_backing");
+    let preimage = TrackedBacking::new(preimage_vec, release_probe.clone(), "preimage_backing");
+
+    // 10. Admit ALL remaining resources BEFORE the admitted journal reservation:
+    //     crypto-temporary coverage, caller-owned output, admitted reservation
+    //     workspace (its continuation coverage is carried by the returned
+    //     continuation), and admitted publication workspace.
+    let _crypto_res = match owner.backend.accounting().reserve(crypto_temp_charge()) {
+        Ok(r) => r,
+        Err(_) => return RealFreshSignOutcome::CryptoAdmitRefused,
+    };
+    let mut output = match RetrievalWorkspaceOwner::new(&owner.backend).admit_output() {
+        Ok(o) => o,
+        Err(_) => return RealFreshSignOutcome::OutputAdmitRefused,
+    };
+    let reserve_ws = match journal.admit_reserve_workspace() {
+        Ok(w) => w,
+        Err(_) => return RealFreshSignOutcome::ReserveWorkspaceAdmitRefused,
+    };
+    let mut publish_ws = match journal.admit_publish_workspace() {
+        Ok(w) => w,
+        Err(_) => return RealFreshSignOutcome::PublishWorkspaceAdmitRefused,
+    };
+
+    // 11. Admitted reservation. Proceed ONLY on a fresh reservation; every
+    //     existing-position classification is non-delivering in this helper.
+    let cont = match journal.reserve_for_sign_admitted(&position, &binding, reserve_ws) {
+        Ok(AdmittedReservationOutcome::FreshlyReserved(c)) => c,
+        Ok(AdmittedReservationOutcome::Conflict) => return RealFreshSignOutcome::ReserveConflict,
+        Ok(AdmittedReservationOutcome::ReservedPotentiallySigned)
+        | Ok(AdmittedReservationOutcome::LiveUnacknowledgedPotentiallySigned)
+        | Ok(AdmittedReservationOutcome::SignedRetainableElsewhere) => {
+            return RealFreshSignOutcome::ReservePotentiallySigned;
+        }
+        Ok(AdmittedReservationOutcome::Exhausted) => return RealFreshSignOutcome::ReserveExhausted,
+        Ok(AdmittedReservationOutcome::LiveCapacityExhausted) => {
+            return RealFreshSignOutcome::ReserveLiveCapacityExhausted;
+        }
+        Ok(AdmittedReservationOutcome::WorkspaceCapacityExceeded) => {
+            return RealFreshSignOutcome::ReserveWorkspaceCapacityExceeded;
+        }
+        Ok(AdmittedReservationOutcome::AccountingUncertain) => {
+            return RealFreshSignOutcome::ReserveAccountingUncertain;
+        }
+        Err(AdmittedReserveError::Storage(_)) => return RealFreshSignOutcome::ReserveStorage,
+        Err(_) => return RealFreshSignOutcome::ReserveFailed,
+    };
+
+    // 12. Consume once; preserve continuous reservation ownership through the
+    //     continuation-to-publication-capability transfer.
+    let cap = match journal.consume_for_signing_admitted(cont) {
+        Ok(c) => c,
+        Err(_) => return RealFreshSignOutcome::ConsumeFailed,
+    };
+
+    // 13. Deterministic in-flight current-authorization replacement strictly
+    //     between the ORIGINAL ticket's admit and its pre-signing confirm.
+    if let ReconfirmPerturbation::AdvanceGenerationBeforeConfirm = reconfirm {
+        snapshot
+            .owner_mut()
+            .replace_for_fixture(LocalAuthorizationState::MissingStorage);
+    }
+
+    // 14. Confirm the ORIGINAL authorization ticket immediately before signing.
+    if snapshot.owner().confirm(&ticket).is_err() {
+        return RealFreshSignOutcome::AuthorizationConfirmRefused;
+    }
+
+    // 15. Bounded model-only coordination hook at the fixed protected point.
+    coord.on_post_consume_pre_sign();
+
+    // 16. Sign ONCE through the real caller-buffer path, writing into the admitted
+    //     output writer with the EXACT bound preimage. Validate the returned length
+    //     BEFORE committing or slicing: require the selected ML-DSA-44 size and the
+    //     previously checked bound.
+    let n = {
+        let mut writer = output.begin_write();
+        let buf = writer.buffer();
+        match signer.sign_vote_into(preimage.as_slice(), buf) {
+            Ok(written) => {
+                if written == 0 {
+                    return RealFreshSignOutcome::EmptyWritten;
+                }
+                if written > crate::signing_journal_admission::OUTPUT_CAP {
+                    return RealFreshSignOutcome::OversizeWritten;
+                }
+                if written != qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE || written != bound {
+                    return RealFreshSignOutcome::WrongLength;
+                }
+                match writer.commit(written) {
+                    Ok(m) => m,
+                    Err(_) => return RealFreshSignOutcome::OversizeWritten,
+                }
+            }
+            Err(_) => return RealFreshSignOutcome::SignerFailed,
+        }
+    };
+    debug_assert_eq!(n, output.used(), "committed length equals the output's valid span");
+
+    // 17. Admitted publication, with AT MOST one immediate retry and ONLY for the
+    //     selected `Storage(WriteIo)` outcome. The same capability, output, and
+    //     workspace are reused; nothing is re-signed, re-consumed, or re-covered.
+    let mut republished = false;
+    let publish_result = loop {
+        match journal.publish_result_admitted(&cap, &output, &mut publish_ws) {
+            Err(AdmittedPublishError::Storage(BoundedDiag::WriteIo)) if !republished => {
+                republished = true;
+                continue;
+            }
+            other => break other,
+        }
+    };
+    match publish_result {
+        Ok(AdmittedPublishOutcome::Published)
+        | Ok(AdmittedPublishOutcome::AlreadyAcknowledged) => {}
+        Ok(AdmittedPublishOutcome::DifferentResultRefused) => {
+            return RealFreshSignOutcome::PublishDifferentResultRefused;
+        }
+        Ok(AdmittedPublishOutcome::ReservedForeignBinding) => {
+            return RealFreshSignOutcome::PublishReservedForeignBinding;
+        }
+        Ok(AdmittedPublishOutcome::PositionMismatch) => {
+            return RealFreshSignOutcome::PublishPositionMismatch;
+        }
+        Ok(AdmittedPublishOutcome::MalformedRecord) => {
+            return RealFreshSignOutcome::PublishMalformedRecord;
+        }
+        Ok(AdmittedPublishOutcome::NoRecord) => return RealFreshSignOutcome::PublishNoRecord,
+        Err(AdmittedPublishError::Storage(BoundedDiag::ReadIo)) => {
+            return RealFreshSignOutcome::PublishReadIo;
+        }
+        Err(AdmittedPublishError::Storage(BoundedDiag::WriteIo)) => {
+            return RealFreshSignOutcome::PublishWriteIo;
+        }
+        Err(_) => return RealFreshSignOutcome::PublishFailed,
+    }
+
+    // 18. After acknowledgement, attempt acknowledged-operation retirement exactly
+    //     once; report its result SEPARATELY. A retirement failure never erases or
+    //     relabels the publication acknowledgement.
+    let retirement = match journal.retire_admitted(&cap) {
+        Ok(RetirementOutcome::Retired) => RetirementReport::Retired,
+        Err(_) => RetirementReport::Failed,
+    };
+
+    // Fixed-scalar completion. Remaining owned objects and reservations are
+    // destroyed by reverse drop order (covered objects before their reservations;
+    // the safety-domain guard LAST).
+    let diag = sink.record(vote, output.used(), preimage_len, republished, retirement);
+    RealFreshSignOutcome::Published(diag)
 }
 
 
