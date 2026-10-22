@@ -1846,6 +1846,46 @@ fn crypto_temp_charge() -> u128 {
         .saturating_add(qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE as u128)
 }
 
+/// Test-only admission stages at which [`fresh_vote_sign_real_local`] admits a
+/// reservation, mirroring [`RetainedAdmitStage`]. A test may install a per-stage
+/// pressure hook (see `install_real_admit_pressure_hook`) that reserves STANDING
+/// pressure at a chosen stage so exactly that admission refuses deterministically.
+/// This injects real accounting pressure (it does NOT weaken admission) and is
+/// required to isolate each later admission as the FIRST failure, because the
+/// held-guard observation's transient working-set peak dominates the cumulative
+/// charge of every admission after it. Model-only; this whole module is
+/// `#[cfg(test)]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RealAdmitStage {
+    WorkSet,
+    Crypto,
+    Output,
+    ReserveWorkspace,
+    PublishWorkspace,
+}
+
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static REAL_ADMIT_PRESSURE_HOOK: std::cell::RefCell<Option<Box<dyn Fn(RealAdmitStage)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn install_real_admit_pressure_hook<F: Fn(RealAdmitStage) + 'static>(f: F) {
+    REAL_ADMIT_PRESSURE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
+fn clear_real_admit_pressure_hook() {
+    REAL_ADMIT_PRESSURE_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+fn fire_real_admit_pressure(stage: RealAdmitStage) {
+    REAL_ADMIT_PRESSURE_HOOK.with(|h| {
+        if let Some(cb) = h.borrow().as_ref() {
+            cb(stage);
+        }
+    });
+}
+
 /// RUN 422 — the isolated protected ADMITTED REAL fresh-vote signing composition.
 /// ONE ordered protected sequence under a SINGLE serialization-domain guard
 /// acquired FIRST (dropped LAST). It borrows `decided.vote()` exclusively, signs
@@ -1978,6 +2018,7 @@ fn fresh_vote_sign_real_local<H: CommittedHistory + ?Sized>(
 
     // 8. Admit the composition working set BEFORE constructing any covered object.
     let release_probe = current_release_probe();
+    fire_real_admit_pressure(RealAdmitStage::WorkSet);
     let work_res_inner = match owner.backend.accounting().reserve(real_sign_work_charge()) {
         Ok(r) => r,
         Err(_) => return RealFreshSignOutcome::WorkSetAdmitRefused,
@@ -2040,18 +2081,22 @@ fn fresh_vote_sign_real_local<H: CommittedHistory + ?Sized>(
     //     crypto-temporary coverage, caller-owned output, admitted reservation
     //     workspace (its continuation coverage is carried by the returned
     //     continuation), and admitted publication workspace.
+    fire_real_admit_pressure(RealAdmitStage::Crypto);
     let _crypto_res = match owner.backend.accounting().reserve(crypto_temp_charge()) {
         Ok(r) => r,
         Err(_) => return RealFreshSignOutcome::CryptoAdmitRefused,
     };
+    fire_real_admit_pressure(RealAdmitStage::Output);
     let mut output = match RetrievalWorkspaceOwner::new(&owner.backend).admit_output() {
         Ok(o) => o,
         Err(_) => return RealFreshSignOutcome::OutputAdmitRefused,
     };
+    fire_real_admit_pressure(RealAdmitStage::ReserveWorkspace);
     let reserve_ws = match journal.admit_reserve_workspace() {
         Ok(w) => w,
         Err(_) => return RealFreshSignOutcome::ReserveWorkspaceAdmitRefused,
     };
+    fire_real_admit_pressure(RealAdmitStage::PublishWorkspace);
     let mut publish_ws = match journal.admit_publish_workspace() {
         Ok(w) => w,
         Err(_) => return RealFreshSignOutcome::PublishWorkspaceAdmitRefused,
@@ -5206,6 +5251,950 @@ mod tests {
         // After release, an eligible publication on the SAME backend proceeds.
         let new_rev = publish_qc(&owner, &ctx, [0x5Au8; 32], 1, 1);
         assert_eq!(new_rev, 2);
+    }
+
+
+    // ======================================================================
+    // RUN 422 — ADMITTED REAL fresh-vote signing composition tests.
+    //
+    // These exercise `fresh_vote_sign_real_local`: the real caller-buffer
+    // `LocalKeySigner` ML-DSA-44 path driven through the ADMITTED journal
+    // reservation/consumption/publication route under ONE safety-domain guard,
+    // over the BORROWED `decided.vote()` (no clone, no suite rewrite). Fault
+    // signers and fault stores are explicitly fixtures; the positive path uses a
+    // real key whose public half is installed in the authorization context.
+    // ======================================================================
+    mod real_fresh_sign {
+        use super::*;
+        use crate::validator_signer::{BoundedSignError, LocalKeySigner, SignError};
+        use qbind_crypto::ml_dsa44::ValidatorSigningKey;
+
+        /// Suite-100 authority with a REAL ML-DSA-44 public key installed for the
+        /// signer id, a real backend registered under suite 100, and the matching
+        /// SECRET key returned so the fixture can build a genuine `LocalKeySigner`.
+        /// Mirrors `make_authority_wire` (which governs SUITE_PQ_RESERVED_1==100)
+        /// but additionally returns the secret key for fixture-only signing.
+        fn make_real_signing_authority_wire(wire_chain_id: u32) -> (ProposalVoteAuthority, Vec<u8>) {
+            let (mut pk, sk) = MlDsa44Backend::generate_keypair().expect("keygen");
+            pk.shrink_to_fit();
+            assert!(
+                pk.capacity() as u128 <= MODEL_MAX_PUBKEY_BYTES,
+                "fixture provider public-key backing {} exceeds the model bound {}",
+                pk.capacity(),
+                MODEL_MAX_PUBKEY_BYTES
+            );
+            let mut keys: HashMap<ValidatorId, (ConsensusSigSuiteId, Vec<u8>)> = HashMap::new();
+            keys.insert(ValidatorId::new(SIGNER_VID), (SUITE_PQ_RESERVED_1, pk));
+            let domain = ProposalVoteSigningDomainV2::try_new(
+                ChainId(0xD5D5_0000_0000_0001),
+                wire_chain_id,
+                [0x5Du8; 32],
+                [0xA5u8; 32],
+            )
+            .expect("valid signing domain");
+            let pv = ProposalVoteAuthority {
+                validators: Arc::new(authority_validators()),
+                key_provider: Arc::new(TestKeyProvider { keys }),
+                backend_registry: Arc::new(SimpleBackendRegistry::with_backend(
+                    SUITE_PQ_RESERVED_1,
+                    Arc::new(MlDsa44Backend),
+                )),
+                chain_id: QBIND_DEVNET_CHAIN_ID,
+                signer: None,
+                signing_domain: domain,
+            };
+            (pv, sk)
+        }
+
+        fn make_real_signing_authority() -> (ProposalVoteAuthority, Vec<u8>) {
+            make_real_signing_authority_wire(MODEL_WIRE_CHAIN_ID)
+        }
+
+        /// A genuine suite-100 `LocalKeySigner` from the fixture secret key.
+        fn real_local_signer(sk: &[u8]) -> LocalKeySigner {
+            LocalKeySigner::new(
+                ValidatorId::new(SIGNER_VID),
+                MODEL_SUITE_U16,
+                Arc::new(ValidatorSigningKey::new(sk.to_vec())),
+            )
+        }
+
+        /// Establish + associate (to the OWNER's accountant, by Arc identity) +
+        /// enter bounded live mode over `store`. The admitted route requires all
+        /// three; the association MUST be the owner's accountant so the admitted
+        /// reservations draw on the same operational ledger.
+        fn associated_bounded_journal(
+            owner: &SafetyRecordOwner,
+            store: Arc<dyn SigningJournalStorage>,
+            capacity: usize,
+        ) -> SigningReservationJournal {
+            let journal =
+                SigningReservationJournal::initialize(store, DEFAULT_MAX_RESERVED_POSITIONS)
+                    .expect("initialize admitted journal");
+            journal
+                .install_accountant_association(owner.backend_for_test().accounting())
+                .expect("install accountant association");
+            journal
+                .enter_bounded_live_mode(capacity)
+                .expect("enter bounded live mode");
+            journal
+        }
+
+        fn real_fresh_store() -> Arc<dyn SigningJournalStorage> {
+            Arc::new(InMemoryConsensusStorage::new()) as Arc<dyn SigningJournalStorage>
+        }
+
+        // ------------------------------------------------------------------
+        // Counting wrapper over a REAL signer (delegates everything; counts the
+        // actual `sign_vote_into` calls). Reused from the top-level
+        // `CountingValidatorSigner`.
+        // ------------------------------------------------------------------
+
+        /// Fault injection for the bounded caller-buffer signer path. Every variant
+        /// is an explicit FIXTURE, never a real signer.
+        #[derive(Clone, Copy, Debug)]
+        enum RealSignerFault {
+            /// `signature_output_bound` returns `Unsupported`.
+            BoundUnsupported,
+            /// `signature_output_bound` returns a value above the output capacity.
+            BoundTooLarge,
+            /// `signature_output_bound` returns a valid-but-wrong profile size.
+            BoundWrongProfile,
+            /// `sign_vote_into` touches the output then returns an error.
+            SignErrorAfterTouch,
+            /// `sign_vote_into` reports zero written bytes.
+            SignEmpty,
+            /// `sign_vote_into` reports a length above the output capacity.
+            SignOversize,
+        }
+
+        struct FaultValidatorSigner {
+            fault: RealSignerFault,
+            calls: std::sync::atomic::AtomicU32,
+        }
+        impl FaultValidatorSigner {
+            fn new(fault: RealSignerFault) -> Self {
+                Self {
+                    fault,
+                    calls: std::sync::atomic::AtomicU32::new(0),
+                }
+            }
+            fn calls(&self) -> u32 {
+                self.calls.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+        impl ValidatorSigner for FaultValidatorSigner {
+            fn validator_id(&self) -> &ValidatorId {
+                // A stable id matching the bound signer identity. Leaked once per
+                // fixture signer; test-only.
+                static IDS: std::sync::OnceLock<ValidatorId> = std::sync::OnceLock::new();
+                IDS.get_or_init(|| ValidatorId::new(SIGNER_VID))
+            }
+            fn suite_id(&self) -> u16 {
+                MODEL_SUITE_U16
+            }
+            fn sign_proposal(&self, _preimage: &[u8]) -> Result<Vec<u8>, SignError> {
+                Err(SignError::CryptoError)
+            }
+            fn sign_vote(&self, _preimage: &[u8]) -> Result<Vec<u8>, SignError> {
+                Err(SignError::CryptoError)
+            }
+            fn sign_timeout(
+                &self,
+                _view: u64,
+                _high_qc: Option<&qbind_consensus::qc::QuorumCertificate<[u8; 32]>>,
+            ) -> Result<Vec<u8>, SignError> {
+                Err(SignError::CryptoError)
+            }
+            fn sign_timeout_with_chain_id(
+                &self,
+                _chain_id: qbind_types::ChainId,
+                _view: u64,
+                _high_qc: Option<&qbind_consensus::qc::QuorumCertificate<[u8; 32]>>,
+            ) -> Result<Vec<u8>, SignError> {
+                Err(SignError::CryptoError)
+            }
+            fn signature_output_bound(&self) -> Result<usize, BoundedSignError> {
+                match self.fault {
+                    RealSignerFault::BoundUnsupported => Err(BoundedSignError::Unsupported),
+                    RealSignerFault::BoundTooLarge => {
+                        Ok(crate::signing_journal_admission::OUTPUT_CAP + 1)
+                    }
+                    RealSignerFault::BoundWrongProfile => {
+                        // A valid, in-capacity, but non-ML-DSA-44 size.
+                        Ok(64)
+                    }
+                    _ => Ok(qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE),
+                }
+            }
+            fn sign_vote_into(
+                &self,
+                _preimage: &[u8],
+                out: &mut [u8],
+            ) -> Result<usize, BoundedSignError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match self.fault {
+                    RealSignerFault::SignErrorAfterTouch => {
+                        if let Some(b) = out.first_mut() {
+                            *b ^= 0xA5;
+                        }
+                        Err(BoundedSignError::BackendFailed)
+                    }
+                    RealSignerFault::SignEmpty => Ok(0),
+                    RealSignerFault::SignOversize => {
+                        Ok(crate::signing_journal_admission::OUTPUT_CAP + 1)
+                    }
+                    _ => Ok(qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE),
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Admitted-publication fault store. Delegates every operation to an
+        // in-memory inner store, but can inject faults SPECIFICALLY at the
+        // admitted publication envelope read/write. The reserve write-site uses a
+        // DIFFERENT method (`put_signing_envelope_and_metadata_synced`) which is
+        // always delegated, so faults here isolate the publication step only. No
+        // production storage code is modified.
+        // ------------------------------------------------------------------
+        struct AdmittedPublishFaultStore {
+            inner: Arc<InMemoryConsensusStorage>,
+            read_armed: std::sync::atomic::AtomicBool,
+            /// Envelope reads to let pass before the armed read fault fires. The
+            /// admitted RESERVATION performs one existence read for a fresh
+            /// position, so skipping it isolates the PUBLICATION read.
+            read_skip: std::sync::atomic::AtomicU32,
+            /// 0 = none, 1 = before-write, 2 = write-then-error.
+            write_mode: std::sync::atomic::AtomicU8,
+            /// How many more write attempts to fault (then stop).
+            write_remaining: std::sync::atomic::AtomicU32,
+            /// Count of writes actually APPLIED to the inner store.
+            applied_writes: std::sync::atomic::AtomicU32,
+        }
+        impl AdmittedPublishFaultStore {
+            fn new() -> Self {
+                Self {
+                    inner: Arc::new(InMemoryConsensusStorage::new()),
+                    read_armed: std::sync::atomic::AtomicBool::new(false),
+                    read_skip: std::sync::atomic::AtomicU32::new(0),
+                    write_mode: std::sync::atomic::AtomicU8::new(0),
+                    write_remaining: std::sync::atomic::AtomicU32::new(0),
+                    applied_writes: std::sync::atomic::AtomicU32::new(0),
+                }
+            }
+            /// Arm the envelope read fault, letting the first `skip` reads pass
+            /// (the admitted reservation's fresh-position existence read) so the
+            /// PUBLICATION read is the one that fails.
+            fn arm_read(&self, skip: u32) {
+                self.read_skip.store(skip, std::sync::atomic::Ordering::SeqCst);
+                self.read_armed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            /// Arm the publication write fault: `mode` (1 before-write, 2 then),
+            /// firing for the next `times` write attempts.
+            fn arm_write(&self, mode: u8, times: u32) {
+                self.write_mode.store(mode, std::sync::atomic::Ordering::SeqCst);
+                self.write_remaining
+                    .store(times, std::sync::atomic::Ordering::SeqCst);
+            }
+            fn applied_writes(&self) -> u32 {
+                self.applied_writes.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+        impl SigningJournalStorage for AdmittedPublishFaultStore {
+            fn get_signing_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+                self.inner.get_signing_record(key)
+            }
+            fn put_signing_record_synced(
+                &self,
+                key: &[u8],
+                value: &[u8],
+            ) -> Result<(), StorageError> {
+                self.inner.put_signing_record_synced(key, value)
+            }
+            fn get_signing_metadata(&self) -> Result<Option<Vec<u8>>, StorageError> {
+                self.inner.get_signing_metadata()
+            }
+            fn put_signing_metadata_synced(&self, value: &[u8]) -> Result<(), StorageError> {
+                self.inner.put_signing_metadata_synced(value)
+            }
+            fn put_signing_record_and_metadata_synced(
+                &self,
+                record_key: &[u8],
+                record_value: &[u8],
+                metadata_value: &[u8],
+            ) -> Result<(), StorageError> {
+                self.inner.put_signing_record_and_metadata_synced(
+                    record_key,
+                    record_value,
+                    metadata_value,
+                )
+            }
+            fn for_each_signing_namespace_entry(
+                &self,
+                visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<(), StorageError>,
+            ) -> Result<(), StorageError> {
+                self.inner.for_each_signing_namespace_entry(visitor)
+            }
+            fn signing_ownership_domain(&self) -> Arc<SigningOwnershipDomain> {
+                self.inner.signing_ownership_domain()
+            }
+            fn read_signing_envelope_into(
+                &self,
+                journal_key: &[u8],
+                dst: &mut [u8],
+            ) -> Result<Option<usize>, crate::signing_reservation_journal::BoundedStorageError> {
+                use crate::signing_reservation_journal::{BoundedDiag, BoundedStorageError};
+                if self.read_armed.load(std::sync::atomic::Ordering::SeqCst) {
+                    let skip = self.read_skip.load(std::sync::atomic::Ordering::SeqCst);
+                    if skip > 0 {
+                        self.read_skip
+                            .store(skip - 1, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        return Err(BoundedStorageError::Io(BoundedDiag::ReadIo));
+                    }
+                }
+                self.inner.read_signing_envelope_into(journal_key, dst)
+            }
+            fn reissue_signing_envelope_synced(
+                &self,
+                journal_key: &[u8],
+                envelope: &[u8],
+            ) -> Result<(), crate::signing_reservation_journal::BoundedStorageError> {
+                self.inner.reissue_signing_envelope_synced(journal_key, envelope)
+            }
+            fn put_signing_envelope_and_metadata_synced(
+                &self,
+                journal_key: &[u8],
+                envelope: &[u8],
+                metadata_value: &[u8],
+            ) -> Result<(), crate::signing_reservation_journal::BoundedStorageError> {
+                self.inner.put_signing_envelope_and_metadata_synced(
+                    journal_key,
+                    envelope,
+                    metadata_value,
+                )
+            }
+            fn put_signing_record_envelope_synced(
+                &self,
+                journal_key: &[u8],
+                envelope: &[u8],
+            ) -> Result<(), crate::signing_reservation_journal::BoundedStorageError> {
+                use crate::signing_reservation_journal::{BoundedDiag, BoundedStorageError};
+                let apply_fault = {
+                    let remaining =
+                        self.write_remaining.load(std::sync::atomic::Ordering::SeqCst);
+                    if remaining > 0 {
+                        self.write_remaining
+                            .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                let mode = self.write_mode.load(std::sync::atomic::Ordering::SeqCst);
+                if apply_fault && mode == 1 {
+                    // before-write: refuse WITHOUT touching the backend.
+                    return Err(BoundedStorageError::Io(BoundedDiag::WriteIo));
+                }
+                self.inner
+                    .put_signing_record_envelope_synced(journal_key, envelope)?;
+                self.applied_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if apply_fault && mode == 2 {
+                    // write-then-error: the record was applied, then we refuse.
+                    return Err(BoundedStorageError::Io(BoundedDiag::WriteIo));
+                }
+                Ok(())
+            }
+        }
+
+        // ==================================================================
+        // Positive path: exactly ONE real signer call, a 2,420-byte result, an
+        // acknowledged admitted publication, a Retired result, verified crypto
+        // correspondence, and complete Vote/pin preservation.
+        // ==================================================================
+        #[test]
+        fn real1_positive_single_signer_published_retired_and_verified() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let store = real_fresh_store();
+            let journal = associated_bounded_journal(&owner, store, 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+            let base_vote = decided.vote().clone();
+
+            let ledgers_before = snapshot_ledgers(&owner);
+            let prov_before = pin_provenance_now(&owner, &decided);
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+
+            let diag = match outcome {
+                RealFreshSignOutcome::Published(d) => d,
+                other => panic!("expected Published, got {other:?}"),
+            };
+            assert_eq!(diag.validator_index, SIGNER_VID);
+            assert_eq!(diag.height, 1);
+            assert_eq!(diag.round, 1);
+            assert_eq!(diag.step, 0);
+            // The BORROWED Vote's own wire suite is unchanged (engine-stamped).
+            assert_eq!(diag.suite_id, base_vote.suite_id);
+            assert_eq!(
+                diag.sig_len as usize,
+                qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE,
+                "a genuine ML-DSA-44 signature is exactly 2,420 bytes"
+            );
+            assert_eq!(diag.sig_len, 2420);
+            assert!(!diag.republished, "the clean path performs no retry");
+            assert_eq!(diag.retirement, RetirementReport::Retired);
+            assert_eq!(signer.calls(), 1, "exactly one real signer invocation");
+            assert_eq!(sink.calls, 1, "exactly one sink call");
+            assert_eq!(coord.calls, 1, "the coordination point is reached once");
+
+            // Cryptographic correspondence: verify the PUBLISHED signature against
+            // the fixture's authorized public key and the EXACT preimage bound into
+            // the journal. This is test-only inspection; it authorizes no delivery.
+            let (pos, binding) = retained_pos_binding(&pv, &base_vote);
+            let preimage = pv.signing_domain.vote_preimage(&base_vote);
+            let published_sig = {
+                // Re-reserve at the exact position returns the acknowledged bytes.
+                match journal.reserve_for_sign(&pos, &binding) {
+                    Ok(ReservationOutcome::ExactRetryRetained(sig)) => sig,
+                    other => panic!("expected the acknowledged signature, got {other:?}"),
+                }
+            };
+            assert_eq!(
+                published_sig.len(),
+                qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE
+            );
+            let (_pk_suite, pk) = pv
+                .key_provider
+                .get_suite_and_key(ValidatorId::new(SIGNER_VID))
+                .expect("installed public key");
+            MlDsa44Backend::verify(&pk, &preimage, published_sig.as_slice())
+                .expect("published signature verifies against the authorized public key");
+
+            // Preservation: the complete borrowed Vote and original pin provenance
+            // are unchanged, and both ledgers are restored (the admitted container
+            // standing charge persists while `journal` is live, so compare against a
+            // baseline taken AFTER bounded-mode entry).
+            assert_eq!(decided.vote(), &base_vote, "the borrowed Vote is unchanged");
+            assert_eq!(
+                pin_provenance_now(&owner, &decided),
+                prov_before,
+                "the original pin provenance is preserved"
+            );
+            let _ = ledgers_before;
+        }
+
+        // ==================================================================
+        // Policy refusal before the safety domain / any journal operation.
+        // ==================================================================
+        #[test]
+        fn real_policy_refused_zero_signing() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, _lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+            let wrong = limits(&retained_ctx(5));
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &wrong, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            assert_eq!(outcome, RealFreshSignOutcome::PolicyRefused);
+            assert_eq!(signer.calls(), 0);
+            assert_eq!(sink.calls, 0);
+            assert_eq!(coord.calls, 0);
+        }
+
+        #[test]
+        fn real_observation_refused_zero_signing() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+            let mut wrong_proposal = p1.clone();
+            wrong_proposal.header.parent_block_id = [0x11; 32];
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &wrong_proposal, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            assert_eq!(outcome, RealFreshSignOutcome::ObservationRefused);
+            assert_eq!(signer.calls(), 0);
+            assert_eq!(sink.calls, 0);
+        }
+
+        #[test]
+        fn real_membership_refused_zero_signing() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (mut pv, sk) = make_real_signing_authority();
+            let entries = [0u64, 2, 3]
+                .into_iter()
+                .map(|i| ValidatorSetEntry {
+                    id: ValidatorId::new(i),
+                    voting_power: 1,
+                })
+                .collect::<Vec<_>>();
+            pv.validators = Arc::new(ConsensusValidatorSet::new(entries).expect("set"));
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            assert_eq!(outcome, RealFreshSignOutcome::MembershipRefused);
+            assert_eq!(signer.calls(), 0);
+        }
+
+        #[test]
+        fn real_wrong_wire_chain_zero_signing() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority_wire(MODEL_WIRE_CHAIN_ID + 777);
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            assert_eq!(outcome, RealFreshSignOutcome::WrongWireChain);
+            assert_eq!(signer.calls(), 0);
+        }
+
+        #[test]
+        fn real_suite_mismatch_zero_signing() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (mut pv, sk) = make_real_signing_authority();
+            // Govern a DIFFERENT suite (0) for the key: the signer advertises 100,
+            // so the composition's signer<->key suite agreement fails.
+            let (mut pk, _sk2) = MlDsa44Backend::generate_keypair().expect("keygen");
+            pk.shrink_to_fit();
+            let mut keys: HashMap<ValidatorId, (ConsensusSigSuiteId, Vec<u8>)> = HashMap::new();
+            keys.insert(ValidatorId::new(SIGNER_VID), (ConsensusSigSuiteId::new(0), pk));
+            pv.key_provider = Arc::new(TestKeyProvider { keys });
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            assert_eq!(outcome, RealFreshSignOutcome::SuiteMismatch);
+            assert_eq!(signer.calls(), 0);
+        }
+
+        #[test]
+        fn real_authorization_confirm_refused_after_consume_no_signing() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::AdvanceGenerationBeforeConfirm,
+            );
+            assert_eq!(outcome, RealFreshSignOutcome::AuthorizationConfirmRefused);
+            assert_eq!(signer.calls(), 0, "a post-consume ticket refusal signs zero times");
+            assert_eq!(coord.calls, 0, "the coordination point is after the confirm");
+        }
+
+        // ==================================================================
+        // Signer faults: bound-query and sign-time faults. Actual signer call
+        // counts are read directly.
+        // ==================================================================
+        fn run_fault_signer(fault: RealSignerFault) -> (RealFreshSignOutcome, u32) {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, _sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let signer = FaultValidatorSigner::new(fault);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            (outcome, signer.calls())
+        }
+
+        #[test]
+        fn real_signer_bound_unsupported() {
+            let (o, calls) = run_fault_signer(RealSignerFault::BoundUnsupported);
+            assert_eq!(o, RealFreshSignOutcome::SignerBoundUnsupported);
+            assert_eq!(calls, 0, "a bound-query refusal never calls the signer");
+        }
+
+        #[test]
+        fn real_signer_bound_too_large_is_output_capacity_refusal() {
+            let (o, calls) = run_fault_signer(RealSignerFault::BoundTooLarge);
+            assert_eq!(o, RealFreshSignOutcome::OutputCapacityRefused);
+            assert_eq!(calls, 0);
+        }
+
+        #[test]
+        fn real_signer_bound_wrong_profile_is_profile_refusal() {
+            let (o, calls) = run_fault_signer(RealSignerFault::BoundWrongProfile);
+            assert_eq!(o, RealFreshSignOutcome::ProfileRefused);
+            assert_eq!(calls, 0);
+        }
+
+        #[test]
+        fn real_signer_error_after_touch_counts_one_call() {
+            let (o, calls) = run_fault_signer(RealSignerFault::SignErrorAfterTouch);
+            assert_eq!(o, RealFreshSignOutcome::SignerFailed);
+            assert_eq!(calls, 1, "the faulting signer was invoked exactly once");
+        }
+
+        #[test]
+        fn real_signer_empty_output_rejected() {
+            let (o, calls) = run_fault_signer(RealSignerFault::SignEmpty);
+            assert_eq!(o, RealFreshSignOutcome::EmptyWritten);
+            assert_eq!(calls, 1);
+        }
+
+        #[test]
+        fn real_signer_oversize_reported_length_rejected() {
+            let (o, calls) = run_fault_signer(RealSignerFault::SignOversize);
+            assert_eq!(o, RealFreshSignOutcome::OversizeWritten);
+            assert_eq!(calls, 1);
+        }
+
+        // ==================================================================
+        // Publication faults: read failure, write-before-application, and
+        // write-then-error, distinguished by applied-write counts. The retry
+        // policy allows at most ONE immediate retry and ONLY for Storage(WriteIo).
+        // ==================================================================
+        #[allow(clippy::type_complexity)]
+        fn run_publish_fault(
+            arm: impl FnOnce(&AdmittedPublishFaultStore),
+        ) -> (RealFreshSignOutcome, u32, u32, bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let store = Arc::new(AdmittedPublishFaultStore::new());
+            arm(&store);
+            let journal =
+                associated_bounded_journal(&owner, store.clone() as Arc<dyn SigningJournalStorage>, 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            let republished = match outcome {
+                RealFreshSignOutcome::Published(d) => d.republished,
+                _ => false,
+            };
+            (outcome, signer.calls(), store.applied_writes(), republished)
+        }
+
+        #[test]
+        fn real_publish_read_io_terminal() {
+            let (o, calls, applied, _r) = run_publish_fault(|s| s.arm_read(1));
+            assert_eq!(o, RealFreshSignOutcome::PublishReadIo);
+            assert_eq!(calls, 1, "the signer ran once before the publication read");
+            assert_eq!(applied, 0, "a read failure applies no write");
+        }
+
+        #[test]
+        fn real_publish_write_before_application_no_record() {
+            // Permanent before-write fault: both the first attempt and the single
+            // retry refuse WITHOUT applying a write.
+            let (o, calls, applied, _r) =
+                run_publish_fault(|s| s.arm_write(1, u32::MAX));
+            assert_eq!(o, RealFreshSignOutcome::PublishWriteIo);
+            assert_eq!(calls, 1, "exactly one signer call despite the retry");
+            assert_eq!(applied, 0, "before-write failures never apply a record");
+        }
+
+        #[test]
+        fn real_publish_write_then_error_applies_record() {
+            // Permanent write-then-error: the record IS applied, then the write
+            // refuses, on both the first attempt and the retry.
+            let (o, calls, applied, _r) =
+                run_publish_fault(|s| s.arm_write(2, u32::MAX));
+            assert_eq!(o, RealFreshSignOutcome::PublishWriteIo);
+            assert_eq!(calls, 1, "exactly one signer call despite the retry");
+            assert!(applied >= 1, "write-then-error applies the record before failing");
+        }
+
+        #[test]
+        fn real_publish_single_write_io_retry_succeeds() {
+            // One-shot WriteIo before application: the first publish attempt
+            // refuses, the single retry (same capability/output/workspace, no
+            // re-sign) succeeds and is acknowledged as Published.
+            let (o, calls, _applied, republished) =
+                run_publish_fault(|s| s.arm_write(1, 1));
+            match o {
+                RealFreshSignOutcome::Published(d) => {
+                    assert!(d.republished, "the diagnostic records the single retry");
+                    assert_eq!(d.retirement, RetirementReport::Retired);
+                }
+                other => panic!("expected Published after one retry, got {other:?}"),
+            }
+            assert_eq!(calls, 1, "the retry never re-signs");
+            assert!(republished);
+        }
+
+        // ==================================================================
+        // Resource-admission refusals isolated BEFORE any journal reservation,
+        // via a model-only per-stage pressure hook that reserves real standing
+        // pressure at the chosen stage. Zero signing; no reservation delivered.
+        // ==================================================================
+        fn run_stage_pressure(stage: RealAdmitStage, expect: RealFreshSignOutcome) {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+
+            // Reserve standing pressure that exhausts the operational ledger at the
+            // chosen stage. The reservation is held for the whole model call.
+            let backend = owner.backend_for_test().clone();
+            let held: std::cell::RefCell<Vec<_>> = std::cell::RefCell::new(Vec::new());
+            install_real_admit_pressure_hook(move |s| {
+                if s == stage {
+                    // Exhaust whatever headroom remains so THIS admission refuses.
+                    let huge = u128::MAX / 2;
+                    if let Ok(r) = backend.accounting().reserve(huge) {
+                        held.borrow_mut().push(r);
+                    } else {
+                        // Already saturated: reserve the remaining slack in a loop
+                        // of decreasing sizes to drive the ledger to its ceiling.
+                        let mut step = 1u128 << 40;
+                        while step > 0 {
+                            while let Ok(r) = backend.accounting().reserve(step) {
+                                held.borrow_mut().push(r);
+                            }
+                            step >>= 1;
+                        }
+                    }
+                }
+            });
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            clear_real_admit_pressure_hook();
+            assert_eq!(outcome, expect);
+            assert_eq!(signer.calls(), 0, "a resource refusal signs zero times");
+            assert_eq!(sink.calls, 0);
+        }
+
+        #[test]
+        fn real_output_admission_refused_before_reservation() {
+            run_stage_pressure(
+                RealAdmitStage::Output,
+                RealFreshSignOutcome::OutputAdmitRefused,
+            );
+        }
+
+        #[test]
+        fn real_crypto_admission_refused_before_reservation() {
+            run_stage_pressure(
+                RealAdmitStage::Crypto,
+                RealFreshSignOutcome::CryptoAdmitRefused,
+            );
+        }
+
+        #[test]
+        fn real_reserve_workspace_admission_refused_before_reservation() {
+            run_stage_pressure(
+                RealAdmitStage::ReserveWorkspace,
+                RealFreshSignOutcome::ReserveWorkspaceAdmitRefused,
+            );
+        }
+
+        #[test]
+        fn real_publish_workspace_admission_refused_before_reservation() {
+            run_stage_pressure(
+                RealAdmitStage::PublishWorkspace,
+                RealFreshSignOutcome::PublishWorkspaceAdmitRefused,
+            );
+        }
+
+        // ==================================================================
+        // Serialization: a competing same-domain publication is excluded at the
+        // fixed protected point. A bounded, completed handshake observes
+        // `WouldBlock`; after the guard releases, an eligible publication proceeds.
+        // ==================================================================
+        #[test]
+        fn real_serialization_excludes_competing_publication() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+
+            let (req_tx, req_rx) = std::sync::mpsc::channel::<()>();
+            let (res_tx, res_rx) = std::sync::mpsc::channel::<PeerDomainObservation>();
+            let probe_backend = owner.backend_for_test().clone();
+            let peer = std::thread::spawn(move || {
+                // Wait for the model to reach the protected point, then try to
+                // acquire the SAME domain; it must observe WouldBlock.
+                if req_rx.recv().is_err() {
+                    return;
+                }
+                let obs = match probe_backend.try_lock_domain_for_test() {
+                    TryLockDomainOutcome::WouldBlock => PeerDomainObservation::WouldBlock,
+                    TryLockDomainOutcome::Acquired(_g) => PeerDomainObservation::Acquired,
+                    TryLockDomainOutcome::Poisoned => PeerDomainObservation::Poisoned,
+                };
+                let _ = res_tx.send(obs);
+            });
+            let mut coord = ModelCoordinationHook::probing(
+                req_tx,
+                res_rx,
+                std::time::Duration::from_secs(5),
+            );
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            peer.join().expect("peer thread joins");
+            assert!(matches!(outcome, RealFreshSignOutcome::Published(_)));
+            assert!(!coord.failed, "the handshake completed on every leg");
+            assert_eq!(
+                coord.last_excluded,
+                Some(true),
+                "the competing same-domain publication observed WouldBlock"
+            );
+            assert_eq!(signer.calls(), 1);
+
+            // After release, an eligible publication on the SAME backend proceeds.
+            let new_rev = publish_qc(&owner, &ctx, [0x5Au8; 32], 1, 1);
+            assert_eq!(new_rev, 2);
+        }
+
+        // ==================================================================
+        // Accounting: live-phase sampling of BOTH ledgers within the unchanged
+        // ceilings, and exact cleanup with the borrowed envelope/pin and the
+        // standing admitted container still live.
+        // ==================================================================
+        #[test]
+        fn real_accounting_live_phase_and_cleanup() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (owner, engine, decided, p1, lim, _rev) = capture_multi(dir.path(), &ctx);
+            let (pv, sk) = make_real_signing_authority();
+            let mut snapshot = established_snapshot(&pv);
+            let journal = associated_bounded_journal(&owner, real_fresh_store(), 1);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            // Sampling hook reads BOTH ledgers at the live signing phase.
+            let mut coord = ModelCoordinationHook::sampling(owner.backend_for_test().clone());
+            let base_vote = decided.vote().clone();
+
+            // Baseline sampled AFTER bounded-mode entry (the standing container
+            // charge is part of the resting ledger while `journal` is live).
+            let ledgers_before = snapshot_ledgers(&owner);
+            let prov_before = pin_provenance_now(&owner, &decided);
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner, &engine, &decided, &p1, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal, &mut coord,
+                ReconfirmPerturbation::None,
+            );
+            assert!(matches!(outcome, RealFreshSignOutcome::Published(_)));
+
+            // Live-phase observations exist and strictly exceed the resting
+            // baseline (the crypto coverage, output, reservation workspace, and
+            // working set are all charged during the protected sequence).
+            let live_op = coord.observed_operational.expect("operational sample");
+            let live_agg = coord.observed_aggregate.expect("aggregate sample");
+            assert!(
+                live_op > ledgers_before.operational,
+                "the live operational charge {} exceeds the resting baseline {}",
+                live_op,
+                ledgers_before.operational
+            );
+            assert!(live_agg >= ledgers_before.aggregate);
+
+            // Exact cleanup: with the borrowed envelope/pin and the standing
+            // admitted container still live, BOTH ledgers return to the resting
+            // baseline and the Vote/pin provenance are unchanged.
+            assert_cleanup_preserved(
+                &owner, &decided, &base_vote, ledgers_before, prov_before,
+                "the successful real-signer run",
+            );
+            assert_eq!(signer.calls(), 1);
+        }
     }
 
 }
