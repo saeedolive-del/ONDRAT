@@ -9014,6 +9014,848 @@ mod tests {
         // and a thread-local RAII probe compares the EXACT verified retrieved slice
         // against that witness immediately before the scalar sink.
         // ==================================================================
+        // ==================================================================
+        // RUN 422 §13.6 — ISOLATED, TEST-ONLY store CLOSE/REOPEN recovery
+        // boundary. A genuine close/reopen of BOTH persistent backends (the
+        // safety record store and the signing-reservation journal) across two
+        // separate temporary directories: incarnation A establishes the coherent
+        // suite-100 engine, the acknowledged L0 restriction, a captured decision
+        // and the case-specific durable signing state, then EVERY A owner/backend
+        // clone, journal handle and storage Arc that retains a RocksDB instance is
+        // dropped. Incarnation B reopens the SAME directories; a successful B
+        // reopen over the released RocksDB LOCK is the close evidence. Engine
+        // reconstruction and any deliberately retained A objects are HARNESS
+        // behavior: this is clean-reopen evidence, NOT process-death, power-loss,
+        // or production-restart acceptance. The fixture authority/key and
+        // signing-domain inputs are shared across A and B; no A Vote, pin, proof,
+        // incarnation or provenance is ever modified to obtain acceptance.
+        // ==================================================================
+
+        use crate::safety_record_store::prepared::ProvenanceRefusal;
+        use crate::signing_reservation_journal::{SigningDecisionRecord, SigningRecordStage};
+        use crate::storage::RocksDbConsensusStorage;
+
+        /// TEST-ONLY: open a PERSISTENT RocksDB signing-journal store over `dir`.
+        fn reopen_open_journal_store(dir: &std::path::Path) -> Arc<RocksDbConsensusStorage> {
+            Arc::new(RocksDbConsensusStorage::open(dir).expect("open persistent journal store"))
+        }
+
+        /// TEST-ONLY: A-era — initialize + associate (to the OWNER's accountant) +
+        /// enter bounded live mode over a PERSISTENT journal store.
+        fn reopen_assoc_journal_init(
+            owner: &SafetyRecordOwner,
+            store: Arc<dyn SigningJournalStorage>,
+            capacity: usize,
+        ) -> SigningReservationJournal {
+            let journal =
+                SigningReservationJournal::initialize(store, DEFAULT_MAX_RESERVED_POSITIONS)
+                    .expect("A-era initialize admitted journal");
+            journal
+                .install_accountant_association(owner.backend_for_test().accounting())
+                .expect("A install accountant association");
+            journal
+                .enter_bounded_live_mode(capacity)
+                .expect("A enter bounded live mode");
+            journal
+        }
+
+        /// TEST-ONLY: B-era — REOPEN the established journal over a genuinely new
+        /// RocksDB instance via `SigningReservationJournal::open` (never the
+        /// initialization fallback), install B's accountant association, then
+        /// explicitly enter bounded live mode before any admitted journal use.
+        fn reopen_assoc_journal_open(
+            owner: &SafetyRecordOwner,
+            store: Arc<dyn SigningJournalStorage>,
+            capacity: usize,
+        ) -> SigningReservationJournal {
+            let journal = SigningReservationJournal::open(store)
+                .expect("B-era reopen of the established journal (no init fallback)");
+            journal
+                .install_accountant_association(owner.backend_for_test().accounting())
+                .expect("B install accountant association");
+            journal
+                .enter_bounded_live_mode(capacity)
+                .expect("B enter bounded live mode");
+            journal
+        }
+
+        /// TEST-ONLY: B-era — attach a fresh owner over the SAME reopened safety
+        /// directory (no initialize; the directory is already established).
+        fn reopen_attach(dir: &std::path::Path, ctx: &PinnedSafetyContext) -> SafetyRecordOwner {
+            SafetyRecordOwner::attach(open_enabled(dir), ctx.clone())
+                .expect("B attach over reopened safety store")
+        }
+
+        /// TEST-ONLY: a non-consuming provenance probe that RETURNS the typed
+        /// refusal (unlike `pin_provenance_now`, which expects success), so a reopen
+        /// test can assert the EXACT Missing/Foreign diagnostic for a retained A-era
+        /// pin presented under incarnation B.
+        fn pin_provenance_try(
+            owner: &SafetyRecordOwner,
+            decided: &qbind_consensus::DecidedVote<OwningCapturePayload>,
+        ) -> Result<PreparedProvenance, ProvenanceRefusal> {
+            let guard = owner.backend.lock_domain();
+            owner.pin_provenance_locked(&guard, decided.payload().pin())
+        }
+
+        /// TEST-ONLY: read the acknowledged `Signed` record directly from the
+        /// reopened persistent journal store and copy its retained signature into a
+        /// fixed-size witness. Mirrors the checked-retained module's
+        /// `witness_from_store` but reads through the reopened `dyn` store.
+        fn reopen_witness_from_store(
+            store: &Arc<dyn SigningJournalStorage>,
+            position: &SigningPosition,
+            binding: &BindingDigest,
+        ) -> RetainedSliceWitness {
+            let raw = store
+                .get_signing_record(&position.storage_key())
+                .expect("bounded record read succeeds after reopen")
+                .expect("the acknowledged Signed record survived the reopen");
+            let record = SigningDecisionRecord::decode(&raw).expect("record decodes");
+            assert_eq!(
+                record.stage,
+                SigningRecordStage::Signed,
+                "the witness is read from the acknowledged Signed stage"
+            );
+            assert_eq!(record.position, *position, "the witnessed record is at the exact position");
+            assert_eq!(record.binding, *binding, "the witnessed record carries the exact binding");
+            let sig = record
+                .retained_signature
+                .expect("a Signed record retains its signature");
+            assert_eq!(
+                sig.len(),
+                qbind_crypto::ml_dsa44::ML_DSA_44_SIGNATURE_SIZE,
+                "the reopened publication retains the full 2,420-byte signature"
+            );
+            RetainedSliceWitness::from_validated(&sig)
+        }
+
+        /// TEST-ONLY: B-era recovery + owning capture under the recovered
+        /// restriction. O2 inspection (distinct from O5 publication), O3 recovery
+        /// proof, a DIRECT comparison of the recovered Locked identity/revision with
+        /// the reconstructed engine lock, O5 with B's own proof, the recovery proof
+        /// dropped BEFORE a SEPARATE fresh capture proof is obtained, then the
+        /// existing owning capture route. Returns B's `DecidedVote`.
+        fn reopen_b_recover_and_capture(
+            owner: &SafetyRecordOwner,
+            engine: &mut BasicHotStuffEngine<[u8; 32]>,
+            p1: &BlockProposal,
+            lim: &PreparedDecisionInputLimits,
+            expected_lock_block: [u8; 32],
+        ) -> DecidedVote<OwningCapturePayload> {
+            let meta = owner.open().expect("B O2 open");
+            let rev = meta.current_revision;
+            assert!(
+                owner.recovery_required(),
+                "a freshly reopened backend requires recovery before O5"
+            );
+            let recovery = owner
+                .read_validate(None::<&FixtureCommittedHistory>)
+                .expect("B O3 recovery proof");
+            // Direct recovered-restriction / reconstructed-engine-lock comparison
+            // (NOT a lifecycle predicate requiring a B capture that does not exist).
+            let durable = GenerationIdentity::from_retained(recovery.retained())
+                .expect("the recovered Locked record yields a restriction identity");
+            let lk = engine.locked_qc().expect("the reconstructed engine lock is present");
+            assert_eq!(durable.lock_block_id, lk.block_id, "recovered id == engine lock id");
+            assert_eq!(durable.lock_block_id, expected_lock_block, "recovered id is the A-era L0 block");
+            assert_eq!(durable.lock_view, 0, "the reconstructed engine still locks L0");
+            assert_eq!(lk.view, 0, "the engine lock view is L0");
+            assert_eq!(rev, recovery.publication_revision(), "O3 revision == recovered authoritative revision");
+            match owner.reacknowledge(&recovery) {
+                PublishResult::DurableAcknowledged { new_revision } => {
+                    assert_eq!(new_revision, rev, "a clean reopen republishes the same revision");
+                }
+                other => panic!("B O5 must acknowledge, got {other:?}"),
+            }
+            assert!(!owner.recovery_required(), "a successful B O5 clears recovery");
+            // Drop the recovery proof BEFORE obtaining the separate capture proof,
+            // preventing accidental overlap of two full proofs.
+            drop(recovery);
+            let cap_proof = owner
+                .read_validate(None::<&FixtureCommittedHistory>)
+                .expect("B O3 proof for capture");
+            match owner.decide_and_capture_owned(engine, ValidatorId::new(2), p1, lim, rev, cap_proof) {
+                OwnedDecisionOutcome::Decided(dv) => dv,
+                other => panic!("B owning capture must Decide, got {other:?}"),
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 1. No A reservation at the position → B-era fresh capture takes the
+        //    admitted real-signing path: ONE signer, ONE sink, durable-position
+        //    count 0 → 1, and the stored signature verifies against the exact
+        //    journal-bound preimage.
+        // ------------------------------------------------------------------
+        #[test]
+        fn reopen_b_era_fresh_admitted_single_signer_single_sink() {
+            let safety_dir = tempfile::tempdir().unwrap();
+            let journal_dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (pv, sk) = make_real_signing_authority();
+
+            // ---- Incarnation A: establish, no reservation at the position. ----
+            let (owner_a, engine_a, a_decided, _p1_a, lim, _rev_a) =
+                capture_multi_with_suite(safety_dir.path(), &ctx, MODEL_SUITE_U16);
+            let a_base_vote = a_decided.vote().clone();
+            let store_a = reopen_open_journal_store(journal_dir.path());
+            let journal_a =
+                reopen_assoc_journal_init(&owner_a, store_a.clone() as Arc<dyn SigningJournalStorage>, 1);
+            assert_eq!(journal_a.reserved_position_count(), 0, "A initialized the journal with no reservation");
+            let a_acct = owner_a.backend_for_test().accounting_handle_for_test();
+
+            // ---- Close A: drop every handle that retains a RocksDB instance. ----
+            drop(journal_a);
+            drop(store_a);
+            drop(a_decided);
+            drop(engine_a);
+            drop(owner_a);
+
+            // ---- Incarnation B: reopen both stores. ----
+            let owner_b = reopen_attach(safety_dir.path(), &ctx);
+            let store_b = reopen_open_journal_store(journal_dir.path());
+            let journal_b =
+                reopen_assoc_journal_open(&owner_b, store_b.clone() as Arc<dyn SigningJournalStorage>, 1);
+            let b_acct = owner_b.backend_for_test().accounting_handle_for_test();
+            assert!(
+                !a_acct.same_ledger(&b_acct),
+                "A and B are INDEPENDENT accounting authorities across the reopen"
+            );
+            assert_eq!(journal_b.reserved_position_count(), 0, "the reopened journal recovers the empty position set");
+
+            let (mut engine_b, p1_b, l0_block) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
+            let b_decided = reopen_b_recover_and_capture(&owner_b, &mut engine_b, &p1_b, &lim, l0_block);
+            let b_base_vote = b_decided.vote().clone();
+            assert_eq!(a_base_vote, b_base_vote, "the independently derived A and B self-votes correspond");
+
+            // ---- B-era strict real fresh-signing composition. ----
+            let mut snapshot = established_snapshot(&pv);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner_b, &engine_b, &b_decided, &p1_b, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal_b, &mut coord, ReconfirmPerturbation::None,
+            );
+            let diag = match outcome {
+                RealFreshSignOutcome::Published(d) => d,
+                other => panic!("expected Published on the B-era eligible real path, got {other:?}"),
+            };
+            assert_eq!(diag.sig_len, 2420, "ML-DSA-44 signature size");
+            assert_eq!(diag.retirement, RetirementReport::Retired, "the admitted publication is retired");
+            assert!(!diag.republished, "the clean path performs no retry");
+            assert_eq!(signer.calls(), 1, "exactly ONE real signer invocation");
+            assert_eq!(sink.calls, 1, "exactly ONE completion sink call");
+            assert_eq!(coord.calls, 1, "the coordination point is reached once");
+            assert_eq!(journal_b.reserved_position_count(), 1, "durable-position count advances 0 -> 1");
+
+            // The stored signature VERIFIES against the exact journal-bound preimage.
+            let (pos, binding) = retained_pos_binding(&pv, &b_base_vote);
+            let preimage = pv.signing_domain.vote_preimage(&b_base_vote);
+            let published_sig = match journal_b.reserve_for_sign(&pos, &binding) {
+                Ok(ReservationOutcome::ExactRetryRetained(sig)) => sig,
+                other => panic!("expected the acknowledged signature, got {other:?}"),
+            };
+            assert_eq!(published_sig.len(), 2420, "the stored record holds the full signature");
+            let (_suite, pk) = pv
+                .key_provider
+                .get_suite_and_key(ValidatorId::new(SIGNER_VID))
+                .expect("the authorized public key is installed");
+            MlDsa44Backend::verify(&pk, &preimage, &published_sig)
+                .expect("the stored signature verifies under the authorized key and bound preimage");
+
+            // ---- Teardown: drop every B owning object; B's ledger returns to 0. ----
+            drop(b_decided);
+            drop(engine_b);
+            drop(journal_b);
+            drop(store_b);
+            drop(owner_b);
+            assert_eq!(b_acct.aggregate().current(), 0, "B's aggregate ledger returns to zero after full teardown");
+        }
+
+        // ------------------------------------------------------------------
+        // 2. A persisted `Reserved` (continuation dropped, unpublished) → after
+        //    reopen the B-era protected fresh composition is NON-delivering
+        //    (`ReservePotentiallySigned`): zero signer/sink, unchanged record
+        //    bytes, unchanged durable-position count.
+        // ------------------------------------------------------------------
+        #[test]
+        fn reopen_persisted_reserved_blocks_fresh_zero_signer() {
+            let safety_dir = tempfile::tempdir().unwrap();
+            let journal_dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (pv, sk) = make_real_signing_authority();
+
+            // ---- A: admit a genuine Reserved record, then DROP its continuation. ----
+            let (owner_a, engine_a, a_decided, _p1_a, lim, _rev_a) =
+                capture_multi_with_suite(safety_dir.path(), &ctx, MODEL_SUITE_U16);
+            let a_base_vote = a_decided.vote().clone();
+            let store_a = reopen_open_journal_store(journal_dir.path());
+            let journal_a =
+                reopen_assoc_journal_init(&owner_a, store_a.clone() as Arc<dyn SigningJournalStorage>, 1);
+            let (a_pos, a_binding) = retained_pos_binding(&pv, &a_base_vote);
+            let ws = journal_a.admit_reserve_workspace().expect("admit A reserve workspace");
+            match journal_a.reserve_for_sign_admitted(&a_pos, &a_binding, ws) {
+                Ok(AdmittedReservationOutcome::FreshlyReserved(cont)) => drop(cont), // setup: never consumed/published
+                other => panic!("A setup must FreshlyReserve, got {other:?}"),
+            }
+            assert_eq!(journal_a.reserved_position_count(), 1, "A persisted exactly one Reserved position");
+            let record_before = store_a
+                .get_signing_record(&a_pos.storage_key())
+                .expect("read")
+                .expect("the Reserved record persists");
+            let a_acct = owner_a.backend_for_test().accounting_handle_for_test();
+
+            drop(journal_a);
+            drop(store_a);
+            drop(a_decided);
+            drop(engine_a);
+            drop(owner_a);
+
+            // ---- B: reopen; the Reserved position survives. ----
+            let owner_b = reopen_attach(safety_dir.path(), &ctx);
+            let store_b = reopen_open_journal_store(journal_dir.path());
+            let journal_b =
+                reopen_assoc_journal_open(&owner_b, store_b.clone() as Arc<dyn SigningJournalStorage>, 1);
+            assert!(!a_acct.same_ledger(&owner_b.backend_for_test().accounting_handle_for_test()));
+            assert_eq!(journal_b.reserved_position_count(), 1, "the reopened journal recovers the Reserved position");
+
+            let (mut engine_b, p1_b, l0_block) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
+            let b_decided = reopen_b_recover_and_capture(&owner_b, &mut engine_b, &p1_b, &lim, l0_block);
+            assert_eq!(a_base_vote, *b_decided.vote(), "A and B self-votes correspond (same position)");
+
+            let mut snapshot = established_snapshot(&pv);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let mut sink = RealSignRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+
+            let ledgers_before = snapshot_ledgers(&owner_b);
+            let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner_b, &engine_b, &b_decided, &p1_b, &lim, None, &mut snapshot,
+                &signer, &mut sink, &journal_b, &mut coord, ReconfirmPerturbation::None,
+            );
+            assert_eq!(
+                outcome,
+                RealFreshSignOutcome::ReservePotentiallySigned,
+                "a persisted Reserved record creates no new fresh-signing opportunity"
+            );
+            assert_eq!(signer.calls(), 0, "zero signer calls");
+            assert_eq!(sink.calls, 0, "zero sink calls");
+            assert_eq!(journal_b.reserved_position_count(), 1, "the durable-position count is unchanged");
+            let record_after = store_b
+                .get_signing_record(&a_pos.storage_key())
+                .expect("read")
+                .expect("the Reserved record still persists");
+            assert_eq!(record_before, record_after, "the persisted Reserved bytes are unchanged");
+            assert_eq!(
+                snapshot_ledgers(&owner_b),
+                ledgers_before,
+                "the refused B attempt restores both B ledgers"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // 3. A persisted `Signed` → after reopen the complete strict CHECKED
+        //    retained-use composition retrieves the EXACT bytes, verifies,
+        //    confirms authorization and sinks once, with NO additional signer and
+        //    an unchanged durable-position count.
+        // ------------------------------------------------------------------
+        #[test]
+        fn reopen_persisted_signed_checked_retained_exact_no_signer() {
+            let safety_dir = tempfile::tempdir().unwrap();
+            let journal_dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (pv, sk) = make_real_signing_authority();
+
+            // ---- A: produce a genuine Signed result via the protected real route. ----
+            let (owner_a, engine_a, a_decided, p1_a, lim, _rev_a) =
+                capture_multi_with_suite(safety_dir.path(), &ctx, MODEL_SUITE_U16);
+            let a_base_vote = a_decided.vote().clone();
+            let store_a = reopen_open_journal_store(journal_dir.path());
+            let journal_a =
+                reopen_assoc_journal_init(&owner_a, store_a.clone() as Arc<dyn SigningJournalStorage>, 1);
+            let mut a_snapshot = established_snapshot(&pv);
+            let a_inner = real_local_signer(&sk);
+            let a_signer = CountingValidatorSigner::new(&a_inner);
+            let mut a_sink = RealSignRecordingSink::new();
+            let mut a_coord = ModelCoordinationHook::inert();
+            match fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner_a, &engine_a, &a_decided, &p1_a, &lim, None, &mut a_snapshot,
+                &a_signer, &mut a_sink, &journal_a, &mut a_coord, ReconfirmPerturbation::None,
+            ) {
+                RealFreshSignOutcome::Published(d) => assert_eq!(d.retirement, RetirementReport::Retired),
+                other => panic!("A setup must Publish+Retire, got {other:?}"),
+            }
+            assert_eq!(a_signer.calls(), 1, "A SETUP signer count");
+            assert_eq!(a_sink.calls, 1, "A SETUP sink count");
+            let (a_pos, _a_binding) = retained_pos_binding(&pv, &a_base_vote);
+            let record_before = store_a
+                .get_signing_record(&a_pos.storage_key())
+                .expect("read")
+                .expect("the Signed record persists");
+            assert_eq!(journal_a.reserved_position_count(), 1, "A persisted one Signed position");
+            let a_acct = owner_a.backend_for_test().accounting_handle_for_test();
+
+            drop(journal_a);
+            drop(store_a);
+            drop(a_decided);
+            drop(engine_a);
+            drop(owner_a);
+
+            // ---- B: reopen; the Signed record survives. ----
+            let owner_b = reopen_attach(safety_dir.path(), &ctx);
+            let store_b_concrete = reopen_open_journal_store(journal_dir.path());
+            let store_b = store_b_concrete.clone() as Arc<dyn SigningJournalStorage>;
+            let journal_b = reopen_assoc_journal_open(&owner_b, store_b.clone(), 1);
+            assert!(!a_acct.same_ledger(&owner_b.backend_for_test().accounting_handle_for_test()));
+
+            let (mut engine_b, p1_b, l0_block) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
+            let b_decided = reopen_b_recover_and_capture(&owner_b, &mut engine_b, &p1_b, &lim, l0_block);
+            let b_base_vote = b_decided.vote().clone();
+            assert_eq!(a_base_vote, b_base_vote, "A and B self-votes correspond (same retained position)");
+
+            // The reopened store still holds the exact Signed bytes.
+            let record_after = store_b_concrete
+                .get_signing_record(&a_pos.storage_key())
+                .expect("read")
+                .expect("the Signed record survived the reopen");
+            assert_eq!(record_before, record_after, "the persisted Signed bytes survive the reopen");
+
+            // Witness read OUTSIDE/BEFORE the protected retained operation.
+            let (pos, binding) = retained_pos_binding(&pv, &b_base_vote);
+            let witness = reopen_witness_from_store(&store_b, &pos, &binding);
+            let probe = std::rc::Rc::new(RetainedSliceProbe::new(witness));
+            let guard = install_retained_slice_probe(probe.clone());
+
+            let mut snapshot = established_snapshot(&pv);
+            let b_inner = real_local_signer(&sk);
+            let b_signer = CountingValidatorSigner::new(&b_inner);
+            let mut sink = RetainedUseRecordingSink::new();
+            let mut coord = ModelCoordinationHook::inert();
+            let ledgers_before = snapshot_ledgers(&owner_b);
+            let prov_before = pin_provenance_now(&owner_b, &b_decided);
+
+            // The checked route takes NO `signer`; `b_signer` only proves that no
+            // additional signer invocation occurs during the retained attempt.
+            let outcome = retained_vote_use_checked_model::<FixtureCommittedHistory>(
+                &owner_b, &engine_b, &b_decided, &p1_b, &lim, None, &mut snapshot,
+                &mut sink, &journal_b, &mut coord, ReconfirmPerturbation::None,
+            );
+            drop(guard);
+            let diag = match outcome {
+                ModelRetainedUseOutcome::Consumed(d) => d,
+                other => panic!("expected Consumed on the checked route, got {other:?}"),
+            };
+            assert_eq!(diag.sig_len as usize, 2420, "consumed the full retained slice");
+            assert_eq!(sink.calls, 1, "exactly one scalar sink consumption");
+            assert_eq!(probe.invocations(), 1, "the probe ran exactly once");
+            assert_eq!(probe.last_len(), Some(2420), "observed length is 2420");
+            assert_eq!(probe.last_matched(), Some(true), "the retrieved slice matches the witness byte-for-byte");
+            assert_eq!(b_signer.calls(), 0, "zero additional signing during retained use");
+            assert_eq!(journal_b.reserved_position_count(), 1, "the durable-position count is unchanged");
+            assert_cleanup_preserved(
+                &owner_b, &b_decided, &b_base_vote, ledgers_before, prov_before,
+                "the successful reopened checked retained consumption",
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // 4. A genuine A-issued O3 proof presented to B's O5 → the existing
+        //    foreign-incarnation refusal; durable safety bytes/revision unchanged;
+        //    recovery still required. A genuine B proof then succeeds. The A
+        //    proof's holder stays charged to A, never B.
+        // ------------------------------------------------------------------
+        #[test]
+        fn reopen_a_era_capability_refused_at_o5() {
+            let safety_dir = tempfile::tempdir().unwrap();
+            let journal_dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (_pv, _sk) = make_real_signing_authority();
+
+            let (owner_a, engine_a, a_decided, p1_a, lim, _rev_a) =
+                capture_multi_with_suite(safety_dir.path(), &ctx, MODEL_SUITE_U16);
+            let store_a = reopen_open_journal_store(journal_dir.path());
+            let journal_a =
+                reopen_assoc_journal_init(&owner_a, store_a.clone() as Arc<dyn SigningJournalStorage>, 1);
+            // A genuine A-era O3 proof, retained across the close.
+            let a_proof = owner_a
+                .read_validate(None::<&FixtureCommittedHistory>)
+                .expect("A O3 proof");
+            let a_acct = owner_a.backend_for_test().accounting_handle_for_test();
+
+            drop(journal_a);
+            drop(store_a);
+            drop(a_decided);
+            drop(engine_a);
+            drop(owner_a);
+
+            // After A's database closes, only the retained A proof's holder keeps A
+            // charged; this is A's post-close standing baseline (NOT on B).
+            let a_after_close = a_acct.aggregate().current();
+            assert!(a_after_close > 0, "A's retained proof holder keeps A charged after close");
+
+            let owner_b = reopen_attach(safety_dir.path(), &ctx);
+            let store_b = reopen_open_journal_store(journal_dir.path());
+            let _journal_b =
+                reopen_assoc_journal_open(&owner_b, store_b.clone() as Arc<dyn SigningJournalStorage>, 1);
+            let b_acct = owner_b.backend_for_test().accounting_handle_for_test();
+            assert!(!a_acct.same_ledger(&b_acct));
+
+            let meta_before = owner_b.open().expect("B O2");
+            assert!(owner_b.recovery_required(), "B requires recovery");
+            let b_before = b_acct.aggregate().current();
+
+            // Present the FOREIGN A proof to B's O5: refused by incarnation.
+            match owner_b.reacknowledge(&a_proof) {
+                PublishResult::RefusedPreWrite(_) => {}
+                other => panic!("B O5 must refuse the foreign A proof pre-write, got {other:?}"),
+            }
+            assert!(owner_b.recovery_required(), "the foreign-proof refusal leaves recovery required");
+            let meta_after = owner_b.open().expect("B O2 after refusal");
+            assert_eq!(meta_before.current_revision, meta_after.current_revision, "durable revision unchanged");
+            assert_eq!(
+                b_acct.aggregate().current(),
+                b_before,
+                "the refused A proof added no standing charge to B"
+            );
+            assert_eq!(
+                a_acct.aggregate().current(),
+                a_after_close,
+                "the A proof's holder stayed charged to A throughout the B refusal"
+            );
+
+            // A genuine B-issued proof then succeeds.
+            let (mut engine_b, p1_b, l0_block) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
+            let b_decided = reopen_b_recover_and_capture(&owner_b, &mut engine_b, &p1_b, &lim, l0_block);
+            let _ = (&b_decided, &p1_a);
+
+            // Dropping the A proof releases A's holder charge (close cleanup).
+            drop(a_proof);
+            assert!(
+                a_acct.aggregate().current() < a_after_close,
+                "dropping the retained A proof releases A's holder charge"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // 5. A's pin presented under B: Missing before B installs its registry,
+        //    Foreign after legitimate B capture. Protected fresh AND checked
+        //    attempts with the unchanged A envelope are observation-refused in
+        //    both phases; A's own provenance is preserved via the retained A
+        //    registry observer (NOT B's rejecting lookup).
+        // ------------------------------------------------------------------
+        #[test]
+        fn reopen_a_era_pin_missing_then_foreign() {
+            let safety_dir = tempfile::tempdir().unwrap();
+            let journal_dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (pv, sk) = make_real_signing_authority();
+
+            let (owner_a, engine_a, a_decided, p1_a, lim, _rev_a) =
+                capture_multi_with_suite(safety_dir.path(), &ctx, MODEL_SUITE_U16);
+            let store_a = reopen_open_journal_store(journal_dir.path());
+            let journal_a =
+                reopen_assoc_journal_init(&owner_a, store_a.clone() as Arc<dyn SigningJournalStorage>, 1);
+            // Retain the A registry observer BEFORE closing A (A-provenance preservation).
+            let a_registry = {
+                let g = owner_a.backend_for_test().lock_domain();
+                owner_a
+                    .backend_for_test()
+                    .prepared_registry_installed(&g)
+                    .expect("A registry installed after capture")
+            };
+            let a_handle = a_decided.payload().pin().handle();
+            let a_acct = owner_a.backend_for_test().accounting_handle_for_test();
+
+            drop(journal_a);
+            drop(store_a);
+            drop(engine_a);
+            drop(owner_a);
+            // a_decided is RETAINED for the B attempts with the unchanged A envelope.
+
+            let owner_b = reopen_attach(safety_dir.path(), &ctx);
+            let store_b = reopen_open_journal_store(journal_dir.path());
+            let journal_b =
+                reopen_assoc_journal_open(&owner_b, store_b.clone() as Arc<dyn SigningJournalStorage>, 1);
+            assert!(!a_acct.same_ledger(&owner_b.backend_for_test().accounting_handle_for_test()));
+
+            // Reconstruct the engine and complete B recovery (O2/O3/O5) only; B has
+            // NOT captured yet, so no registry is installed.
+            let meta = owner_b.open().expect("B O2");
+            let rev = meta.current_revision;
+            let recovery = owner_b.read_validate(None::<&FixtureCommittedHistory>).expect("B O3");
+            assert!(matches!(owner_b.reacknowledge(&recovery), PublishResult::DurableAcknowledged { .. }));
+            assert!(!owner_b.recovery_required(), "B O5 cleared recovery");
+            drop(recovery);
+
+            let (mut engine_b, p1_b, _l0_block) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
+            let mut snapshot = established_snapshot(&pv);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+
+            // PHASE 1 — no registry: A pin is Missing; both protected attempts refuse.
+            assert!(
+                matches!(pin_provenance_try(&owner_b, &a_decided), Err(ProvenanceRefusal::Missing)),
+                "before B capture the A pin has no installed registry (Missing)"
+            );
+            let ledgers_p1 = snapshot_ledgers(&owner_b);
+            {
+                let mut fsink = RealSignRecordingSink::new();
+                let mut fcoord = ModelCoordinationHook::inert();
+                let fresh = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                    &owner_b, &engine_b, &a_decided, &p1_a, &lim, None, &mut snapshot,
+                    &signer, &mut fsink, &journal_b, &mut fcoord, ReconfirmPerturbation::None,
+                );
+                assert_eq!(fresh, RealFreshSignOutcome::ObservationRefused, "Missing-phase fresh attempt is observation-refused");
+                assert_eq!(fsink.calls, 0);
+                let mut rsink = RetainedUseRecordingSink::new();
+                let mut rcoord = ModelCoordinationHook::inert();
+                let retained = retained_vote_use_checked_model::<FixtureCommittedHistory>(
+                    &owner_b, &engine_b, &a_decided, &p1_a, &lim, None, &mut snapshot,
+                    &mut rsink, &journal_b, &mut rcoord, ReconfirmPerturbation::None,
+                );
+                assert_eq!(retained, ModelRetainedUseOutcome::ObservationRefused, "Missing-phase checked attempt is observation-refused");
+                assert_eq!(rsink.calls, 0);
+            }
+            assert_eq!(signer.calls(), 0, "zero signing during the Missing phase");
+            assert_eq!(snapshot_ledgers(&owner_b), ledgers_p1, "the Missing-phase attempts restore B's ledgers");
+            assert_eq!(journal_b.reserved_position_count(), 0, "no durable position created in the Missing phase");
+
+            // Legitimate B capture installs B's registry.
+            let cap_proof = owner_b.read_validate(None::<&FixtureCommittedHistory>).expect("B O3 for capture");
+            let b_decided = match owner_b.decide_and_capture_owned(
+                &mut engine_b, ValidatorId::new(2), &p1_b, &lim, rev, cap_proof,
+            ) {
+                OwnedDecisionOutcome::Decided(dv) => dv,
+                other => panic!("B capture must Decide, got {other:?}"),
+            };
+            let _ = &b_decided;
+
+            // PHASE 2 — B registry installed: the A pin is Foreign; attempts refuse.
+            assert!(
+                matches!(pin_provenance_try(&owner_b, &a_decided), Err(ProvenanceRefusal::Foreign)),
+                "after B capture the A pin is classified Foreign by the incarnation check"
+            );
+            let ledgers_p2 = snapshot_ledgers(&owner_b);
+            {
+                let mut fsink = RealSignRecordingSink::new();
+                let mut fcoord = ModelCoordinationHook::inert();
+                let fresh = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                    &owner_b, &engine_b, &a_decided, &p1_a, &lim, None, &mut snapshot,
+                    &signer, &mut fsink, &journal_b, &mut fcoord, ReconfirmPerturbation::None,
+                );
+                assert_eq!(fresh, RealFreshSignOutcome::ObservationRefused, "Foreign-phase fresh attempt is observation-refused");
+                assert_eq!(fsink.calls, 0);
+                let mut rsink = RetainedUseRecordingSink::new();
+                let mut rcoord = ModelCoordinationHook::inert();
+                let retained = retained_vote_use_checked_model::<FixtureCommittedHistory>(
+                    &owner_b, &engine_b, &a_decided, &p1_a, &lim, None, &mut snapshot,
+                    &mut rsink, &journal_b, &mut rcoord, ReconfirmPerturbation::None,
+                );
+                assert_eq!(retained, ModelRetainedUseOutcome::ObservationRefused, "Foreign-phase checked attempt is observation-refused");
+                assert_eq!(rsink.calls, 0);
+            }
+            assert_eq!(signer.calls(), 0, "zero signing across both phases");
+            assert_eq!(snapshot_ledgers(&owner_b), ledgers_p2, "the Foreign-phase attempts restore B's ledgers");
+
+            // A-provenance PRESERVATION via the retained A registry observer — NOT
+            // B's rejecting lookup.
+            let a_prov = a_registry
+                .lock()
+                .expect("A registry lock")
+                .provenance_by_handle(a_handle)
+                .expect("A's own registry still resolves A's pin provenance");
+            assert_eq!(
+                a_prov.identity, pin_provenance_try(&owner_b, &b_decided).expect("B pin resolves").identity,
+                "A's preserved identity is the captured L0 restriction identity"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // 6. A genuine persisted Signed fixture; BEFORE a successful B O5 both
+        //    protected attempts are observation-refused (recovery), with zero
+        //    signer/sink and an unchanged stored result/count. O2/O3 do not clear
+        //    recovery; O5 itself is permitted during recovery.
+        // ------------------------------------------------------------------
+        #[test]
+        fn reopen_use_before_o5_refused() {
+            let safety_dir = tempfile::tempdir().unwrap();
+            let journal_dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (pv, sk) = make_real_signing_authority();
+
+            let (owner_a, engine_a, a_decided, p1_a, lim, _rev_a) =
+                capture_multi_with_suite(safety_dir.path(), &ctx, MODEL_SUITE_U16);
+            let a_base_vote = a_decided.vote().clone();
+            let store_a = reopen_open_journal_store(journal_dir.path());
+            let journal_a =
+                reopen_assoc_journal_init(&owner_a, store_a.clone() as Arc<dyn SigningJournalStorage>, 1);
+            let mut a_snapshot = established_snapshot(&pv);
+            let a_inner = real_local_signer(&sk);
+            let a_signer = CountingValidatorSigner::new(&a_inner);
+            let mut a_sink = RealSignRecordingSink::new();
+            let mut a_coord = ModelCoordinationHook::inert();
+            match fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner_a, &engine_a, &a_decided, &p1_a, &lim, None, &mut a_snapshot,
+                &a_signer, &mut a_sink, &journal_a, &mut a_coord, ReconfirmPerturbation::None,
+            ) {
+                RealFreshSignOutcome::Published(d) => assert_eq!(d.retirement, RetirementReport::Retired),
+                other => panic!("A setup must Publish+Retire, got {other:?}"),
+            }
+            assert_eq!(a_signer.calls(), 1, "A SETUP signer");
+            assert_eq!(a_sink.calls, 1, "A SETUP sink");
+            let (a_pos, _a_binding) = retained_pos_binding(&pv, &a_base_vote);
+            let record_before = store_a
+                .get_signing_record(&a_pos.storage_key())
+                .expect("read")
+                .expect("the Signed record persists");
+
+            drop(journal_a);
+            drop(store_a);
+            drop(engine_a);
+            drop(owner_a);
+            // a_decided retained for the pre-O5 attempts.
+
+            let owner_b = reopen_attach(safety_dir.path(), &ctx);
+            let store_b_concrete = reopen_open_journal_store(journal_dir.path());
+            let store_b = store_b_concrete.clone() as Arc<dyn SigningJournalStorage>;
+            let journal_b = reopen_assoc_journal_open(&owner_b, store_b.clone(), 1);
+
+            // O2 and O3 do NOT clear recovery.
+            let meta = owner_b.open().expect("B O2");
+            assert!(owner_b.recovery_required(), "O2 does not clear recovery");
+            let recovery = owner_b.read_validate(None::<&FixtureCommittedHistory>).expect("B O3");
+            assert!(owner_b.recovery_required(), "O3 does not clear recovery");
+
+            let (mut engine_b, p1_b, _l0) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
+            let _ = (&p1_b,);
+            let mut snapshot = established_snapshot(&pv);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+
+            let ledgers_before = snapshot_ledgers(&owner_b);
+            let mut fsink = RealSignRecordingSink::new();
+            let mut fcoord = ModelCoordinationHook::inert();
+            let fresh = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner_b, &engine_b, &a_decided, &p1_a, &lim, None, &mut snapshot,
+                &signer, &mut fsink, &journal_b, &mut fcoord, ReconfirmPerturbation::None,
+            );
+            assert_eq!(fresh, RealFreshSignOutcome::ObservationRefused, "pre-O5 fresh use is recovery-refused");
+            assert_eq!(fsink.calls, 0);
+            let mut rsink = RetainedUseRecordingSink::new();
+            let mut rcoord = ModelCoordinationHook::inert();
+            let retained = retained_vote_use_checked_model::<FixtureCommittedHistory>(
+                &owner_b, &engine_b, &a_decided, &p1_a, &lim, None, &mut snapshot,
+                &mut rsink, &journal_b, &mut rcoord, ReconfirmPerturbation::None,
+            );
+            assert_eq!(retained, ModelRetainedUseOutcome::ObservationRefused, "pre-O5 checked use is recovery-refused");
+            assert_eq!(rsink.calls, 0);
+            assert_eq!(signer.calls(), 0, "zero B signing before O5");
+            assert_eq!(snapshot_ledgers(&owner_b), ledgers_before, "the pre-O5 attempts restore B's ledgers");
+            let record_mid = store_b_concrete
+                .get_signing_record(&a_pos.storage_key())
+                .expect("read")
+                .expect("the Signed record is unchanged");
+            assert_eq!(record_before, record_mid, "the stored Signed result is unchanged by pre-O5 attempts");
+            assert_eq!(journal_b.reserved_position_count(), 1, "the durable-position count is unchanged");
+
+            // O5 itself is permitted during recovery.
+            assert!(matches!(owner_b.reacknowledge(&recovery), PublishResult::DurableAcknowledged { .. }), "O5 is permitted during recovery");
+            assert!(!owner_b.recovery_required(), "the successful O5 clears recovery");
+            let _ = (&mut engine_b, meta);
+            drop(a_decided);
+        }
+
+        // ------------------------------------------------------------------
+        // 7. Successful B O5 + legitimate B capture, THEN a genuine engine/durable
+        //    disagreement (the engine lock is advanced to L1 by peer votes while
+        //    the acknowledged durable restriction stays L0). Dependent use is
+        //    observation-refused (EngineDurableDisagreement) — DISTINCT from the
+        //    strict lifecycle-equality refusal of a consistent advance.
+        // ------------------------------------------------------------------
+        #[test]
+        fn reopen_o5_success_then_engine_durable_disagreement_refused() {
+            let safety_dir = tempfile::tempdir().unwrap();
+            let journal_dir = tempfile::tempdir().unwrap();
+            let ctx = retained_ctx(4);
+            let (pv, sk) = make_real_signing_authority();
+
+            let (owner_a, engine_a, a_decided, _p1_a, lim, _rev_a) =
+                capture_multi_with_suite(safety_dir.path(), &ctx, MODEL_SUITE_U16);
+            let store_a = reopen_open_journal_store(journal_dir.path());
+            let journal_a =
+                reopen_assoc_journal_init(&owner_a, store_a.clone() as Arc<dyn SigningJournalStorage>, 1);
+
+            drop(journal_a);
+            drop(store_a);
+            drop(a_decided);
+            drop(engine_a);
+            drop(owner_a);
+
+            let owner_b = reopen_attach(safety_dir.path(), &ctx);
+            let store_b = reopen_open_journal_store(journal_dir.path());
+            let journal_b =
+                reopen_assoc_journal_open(&owner_b, store_b.clone() as Arc<dyn SigningJournalStorage>, 1);
+
+            let (mut engine_b, p1_b, l0_block) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
+            let b_decided = reopen_b_recover_and_capture(&owner_b, &mut engine_b, &p1_b, &lim, l0_block);
+            let b_base_vote = b_decided.vote().clone();
+
+            // Advance the ENGINE lock L0 -> L1 via peer votes; leave durable at L0.
+            let l1_block = derive_block_id_local(2, 1, &l0_block);
+            let _ = engine_b.on_vote_event(ValidatorId::new(2), &logical_vote(1, l1_block, 2));
+            let _ = engine_b.on_vote_event(ValidatorId::new(3), &logical_vote(1, l1_block, 3));
+            let lk = engine_b.locked_qc().expect("engine lock present");
+            assert_eq!(lk.block_id, l1_block, "the engine lock advanced to L1");
+            assert_eq!(lk.view, 1, "the engine lock view is L1");
+
+            // The durable restriction is still L0 and recovery is clear.
+            assert!(!owner_b.recovery_required(), "recovery is clear after the successful O5");
+            let durable_proof = owner_b.read_validate(None::<&FixtureCommittedHistory>).expect("B O3");
+            let durable = GenerationIdentity::from_retained(durable_proof.retained())
+                .expect("durable Locked identity");
+            assert_eq!(durable.lock_block_id, l0_block, "the acknowledged durable restriction is still L0");
+            assert_ne!(durable.lock_block_id, lk.block_id, "engine L1 and durable L0 DISAGREE");
+            drop(durable_proof);
+
+            let mut snapshot = established_snapshot(&pv);
+            let inner = real_local_signer(&sk);
+            let signer = CountingValidatorSigner::new(&inner);
+            let ledgers_before = snapshot_ledgers(&owner_b);
+            let prov_before = pin_provenance_now(&owner_b, &b_decided);
+
+            let mut fsink = RealSignRecordingSink::new();
+            let mut fcoord = ModelCoordinationHook::inert();
+            let fresh = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
+                &owner_b, &engine_b, &b_decided, &p1_b, &lim, None, &mut snapshot,
+                &signer, &mut fsink, &journal_b, &mut fcoord, ReconfirmPerturbation::None,
+            );
+            assert_eq!(
+                fresh,
+                RealFreshSignOutcome::ObservationRefused,
+                "engine/durable disagreement is observation-refused (not the lifecycle-equality refusal)"
+            );
+            assert_eq!(fsink.calls, 0);
+            let mut rsink = RetainedUseRecordingSink::new();
+            let mut rcoord = ModelCoordinationHook::inert();
+            let retained = retained_vote_use_checked_model::<FixtureCommittedHistory>(
+                &owner_b, &engine_b, &b_decided, &p1_b, &lim, None, &mut snapshot,
+                &mut rsink, &journal_b, &mut rcoord, ReconfirmPerturbation::None,
+            );
+            assert_eq!(retained, ModelRetainedUseOutcome::ObservationRefused, "disagreement refuses dependent retained use");
+            assert_eq!(rsink.calls, 0);
+            assert_eq!(signer.calls(), 0, "zero signing under the disagreement");
+            assert_eq!(journal_b.reserved_position_count(), 0, "the durable-position count is unchanged");
+            assert_cleanup_preserved(
+                &owner_b, &b_decided, &b_base_vote, ledgers_before, prov_before,
+                "the engine/durable disagreement refusal",
+            );
+        }
+
+
         mod checked_retained {
             use super::*;
             use crate::signing_reservation_journal::{SigningDecisionRecord, SigningRecordStage};
