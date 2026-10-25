@@ -12001,7 +12001,11 @@ mod tests {
                 /// Exited normally with this code (or -1 if unavailable).
                 Exited(i32),
                 /// The status deadline expired; the parent killed and reaped it.
-                TimedOutKilled,
+                /// `kill_confirmed` is true ONLY when the `kill` syscall itself
+                /// succeeded. A false value records a race in which the child had
+                /// already exited (so `kill` errored) but a later `try_wait` still
+                /// observed the exit — reported accurately, never labelled "killed".
+                TimedOutKilled { kill_confirmed: bool },
             }
 
             /// Pure classification of a reaped `ExitStatus` (no scheduling).
@@ -12027,14 +12031,15 @@ mod tests {
                 }
 
                 /// Wait (bounded, `try_wait` polling) for the child to terminate ON
-                /// ITS OWN within `STATUS_DEADLINE`. On timeout, kill and reap
-                /// within `REAP_BUDGET`. Returns the classification or an explicit
-                /// failure string (try_wait error, kill error without an observed
-                /// exit, or unreaped within budget). On success the child is reaped
-                /// and `Drop` becomes a no-op.
-                fn supervise(&mut self) -> Result<TermClass, String> {
+                /// ITS OWN within `status_deadline` (test-selected: the normal
+                /// budget for the boundary, a short budget for the timeout control).
+                /// On timeout, kill and reap within `REAP_BUDGET`. Returns the
+                /// classification or an explicit failure string (try_wait error,
+                /// kill error without an observed exit, or unreaped within budget).
+                /// On success the child is reaped and `Drop` becomes a no-op.
+                fn supervise(&mut self, status_deadline: Duration) -> Result<TermClass, String> {
                     let child = self.child.as_mut().expect("child present");
-                    let deadline = Instant::now() + STATUS_DEADLINE;
+                    let deadline = Instant::now() + status_deadline;
                     loop {
                         match child.try_wait() {
                             Ok(Some(status)) => {
@@ -12052,14 +12057,17 @@ mod tests {
                     }
                     // Deadline path: kill, then reap within REAP_BUDGET. A kill
                     // error is tolerated ONLY if a subsequent try_wait still
-                    // observes the exit; otherwise it is an explicit failure.
+                    // observes the exit; the resulting `kill_confirmed` flag records
+                    // whether the kill syscall itself actually succeeded.
                     let kill_err = child.kill().err();
                     let reap_deadline = Instant::now() + REAP_BUDGET;
                     loop {
                         match child.try_wait() {
                             Ok(Some(_status)) => {
                                 self.child = None;
-                                return Ok(TermClass::TimedOutKilled);
+                                return Ok(TermClass::TimedOutKilled {
+                                    kill_confirmed: kill_err.is_none(),
+                                });
                             }
                             Ok(None) => {
                                 if Instant::now() >= reap_deadline {
@@ -12083,26 +12091,34 @@ mod tests {
                 fn drop(&mut self) {
                     if let Some(mut c) = self.child.take() {
                         // Bounded, NON-panicking cleanup (may run during unwind).
-                        let _ = c.kill();
-                        let deadline = Instant::now() + REAP_BUDGET;
-                        loop {
-                            match c.try_wait() {
-                                Ok(Some(_)) => break,
-                                Ok(None) => {
-                                    if Instant::now() >= deadline {
-                                        eprintln!("R422 PCPD: child unreaped within budget on drop");
-                                        break;
-                                    }
-                                    std::thread::sleep(POLL_STEP);
-                                }
-                                Err(e) => {
-                                    eprintln!("R422 PCPD: try_wait error on drop: {e}");
+                    // Diagnostic writes are fallible and their errors are
+                    // swallowed so a failed stderr write cannot panic here.
+                    let _ = c.kill();
+                    let deadline = Instant::now() + REAP_BUDGET;
+                    loop {
+                        match c.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {
+                                if Instant::now() >= deadline {
+                                    let _ = writeln!(
+                                        std::io::stderr(),
+                                        "R422 PCPD: child unreaped within budget on drop"
+                                    );
                                     break;
                                 }
+                                std::thread::sleep(POLL_STEP);
+                            }
+                            Err(e) => {
+                                let _ = writeln!(
+                                    std::io::stderr(),
+                                    "R422 PCPD: try_wait error on drop: {e}"
+                                );
+                                break;
                             }
                         }
                     }
                 }
+            }
             }
 
             /// Spawn the re-executed child test in the given mode with all streams
@@ -12368,7 +12384,7 @@ mod tests {
                     "missing_marker", &fixture, &marker, &"00".repeat(NONCE_LEN),
                     safety.path(), journal.path(),
                 );
-                let class = child.supervise().expect("reaped");
+                let class = child.supervise(STATUS_DEADLINE).expect("reaped");
                 assert_eq!(class, TermClass::Exited(3), "setup-failure child exits nonzero, no signal");
                 assert!(read_marker_bounded(&marker).is_err(), "no marker was produced");
             }
@@ -12387,7 +12403,7 @@ mod tests {
                     "marker_then_exit", &fixture, &marker, &nonce_to_hex(&nonce),
                     safety.path(), journal.path(),
                 );
-                let class = child.supervise().expect("reaped");
+                let class = child.supervise(STATUS_DEADLINE).expect("reaped");
                 // A COMPLETE marker was written, but the termination is an ordinary
                 // exit — NOT the intended SIGABRT crash evidence.
                 assert_eq!(class, TermClass::Exited(0), "marker-then-exit is not a crash");
@@ -12408,7 +12424,7 @@ mod tests {
                     "wrong_signal", &fixture, &marker, &"00".repeat(NONCE_LEN),
                     safety.path(), journal.path(),
                 );
-                let class = child.supervise().expect("reaped");
+                let class = child.supervise(STATUS_DEADLINE).expect("reaped");
                 assert_eq!(
                     class,
                     TermClass::Signaled(libc::SIGTERM),
@@ -12421,8 +12437,9 @@ mod tests {
             #[test]
             fn supervision_timeout_with_verified_reap() {
                 // A single OWNED long-running process (launched directly, NOT via
-                // `sh -c`, so no descendant is left behind). The status deadline is
-                // reached; the parent kills and verifies reaping.
+                // `sh -c`, so no descendant is left behind). This drives the ACTUAL
+                // `OwnedChild::supervise` timeout branch via a short status budget,
+                // so a regression in that method's timeout/kill/reap path is caught.
                 let child = std::process::Command::new("sleep")
                     .arg("600")
                     .stdin(std::process::Stdio::null())
@@ -12431,35 +12448,24 @@ mod tests {
                     .spawn()
                     .expect("spawn sleep");
                 let mut owned = OwnedChild::new(child);
-                // Drive the deadline quickly via a local bounded wait rather than the
-                // 30s field deadline: poll briefly, then kill+reap.
-                let short = Instant::now() + Duration::from_millis(200);
-                let c = owned.child.as_mut().unwrap();
-                while Instant::now() < short {
-                    match c.try_wait() {
-                        Ok(Some(_)) => panic!("sleep exited unexpectedly early"),
-                        Ok(None) => std::thread::sleep(POLL_STEP),
-                        Err(e) => panic!("try_wait: {e}"),
+                let class = owned
+                    .supervise(Duration::from_millis(200))
+                    .expect("the timed-out child is killed and reaped");
+                // The timeout path was reached (kill confirmed on a live process);
+                // this is cleanup, never the intended SIGABRT crash evidence.
+                match class {
+                    TermClass::TimedOutKilled { kill_confirmed } => {
+                        assert!(kill_confirmed, "the kill of the still-live sleep succeeded");
                     }
+                    other => panic!("expected the supervisor timeout branch, got {other:?}"),
                 }
-                c.kill().expect("kill the timed-out child");
-                let reap_deadline = Instant::now() + REAP_BUDGET;
-                let reaped = loop {
-                    match c.try_wait() {
-                        Ok(Some(status)) => break status,
-                        Ok(None) => {
-                            assert!(Instant::now() < reap_deadline, "reaped within budget");
-                            std::thread::sleep(POLL_STEP);
-                        }
-                        Err(e) => panic!("try_wait during reap: {e}"),
-                    }
-                };
-                owned.child = None; // reaped explicitly
-                assert_eq!(
-                    classify_status(reaped),
-                    TermClass::Signaled(libc::SIGKILL),
-                    "a parent kill (SIGKILL) is cleanup, never the intended crash evidence"
+                assert_ne!(
+                    class,
+                    TermClass::Signaled(EXPECTED_ABORT_SIGNAL),
+                    "a parent kill is cleanup, not SIGABRT crash evidence"
                 );
+                // Ownership is cleared only after the supervisor observed the exit.
+                assert!(owned.child.is_none(), "the child was actually reaped by the supervisor");
             }
 
             #[test]
@@ -12484,10 +12490,18 @@ mod tests {
                     assert!(r.is_err(), "the unwind was caught");
                     pid
                 };
-                // After the guard's Drop, the child must be gone. `kill(pid, 0)` on a
-                // reaped pid returns ESRCH.
-                let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-                assert!(!alive, "the owned child was cleaned up on parent unwind");
+                // After the guard's Drop, the child must be gone. Probe with
+                // `kill(pid, 0)` and capture its errno IMMEDIATELY: a reaped pid
+                // yields a failed probe whose error is EXACTLY ESRCH. EPERM (or any
+                // other error) must NOT count as evidence that the child is gone.
+                let probe = unsafe { libc::kill(pid as libc::pid_t, 0) };
+                let probe_err = std::io::Error::last_os_error();
+                assert_eq!(probe, -1, "probing a reaped pid fails");
+                assert_eq!(
+                    probe_err.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "the owned child is gone (ESRCH), not merely inaccessible (EPERM)"
+                );
             }
 
             // ---------------------------------------------------------------
@@ -12504,7 +12518,8 @@ mod tests {
                 write_fixture_file(&fixture, &pk, &sk);
                 let (rpk, rsk) = read_fixture_file(&fixture);
                 assert_eq!(rpk, pk, "transported public key round-trips");
-                assert_eq!(rsk, sk, "transported secret key round-trips");
+                // Redacted equality: a mismatch must NOT print any secret-key bytes.
+                assert!(rsk == sk, "transported secret key round-trips (contents redacted)");
 
                 let pv = authority_from_pk(rpk);
                 let ctx = retained_ctx(4);
@@ -12594,7 +12609,7 @@ mod tests {
                     "abort_boundary", &fixture, &marker, &nonce_hex,
                     safety_dir.path(), journal_dir.path(),
                 );
-                let class = child.supervise().expect("child reaped");
+                let class = child.supervise(STATUS_DEADLINE).expect("child reaped");
                 assert_eq!(
                     class,
                     TermClass::Signaled(EXPECTED_ABORT_SIGNAL),
@@ -12624,6 +12639,41 @@ mod tests {
                     1,
                     "the reopened journal recovers exactly one Reserved position"
                 );
+
+                // ---- Durable snapshot taken IMMEDIATELY after reopen, BEFORE the
+                //      O2/O3/O5 recovery helper. The marker witness supplies the
+                //      read-only identification (position key + binding); all
+                //      readback allocations are outside the protected operation. ----
+                let rec_pre = store_b_concrete
+                    .get_signing_record(&witness.position_key)
+                    .expect("bounded record read immediately after reopen")
+                    .expect("the Reserved record survived the abrupt process death");
+                let meta_pre = store_b_concrete
+                    .get_signing_metadata()
+                    .expect("bounded journal-metadata read immediately after reopen");
+                let count_pre = journal_b.reserved_position_count();
+                {
+                    let record_pre =
+                        SigningDecisionRecord::decode(&rec_pre).expect("reopened record decodes");
+                    assert_eq!(
+                        record_pre.stage,
+                        SigningRecordStage::Reserved,
+                        "the reopened record is Reserved before recovery"
+                    );
+                    assert_eq!(
+                        record_pre.position.storage_key(),
+                        witness.position_key,
+                        "the reopened record sits at the witnessed position key"
+                    );
+                    assert_eq!(
+                        record_pre.binding.0, witness.binding,
+                        "the reopened record carries the witnessed binding digest"
+                    );
+                    assert!(
+                        record_pre.retained_signature.is_none(),
+                        "a Reserved record retains NO signature before recovery"
+                    );
+                }
 
                 // ---- Recover a surviving-process capture via fresh O2/O3/O5. ----
                 let (mut engine_b, p1_b, l0_block) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
@@ -12661,6 +12711,16 @@ mod tests {
                 );
                 assert_eq!(journal_b.reserved_position_count(), 1, "successful O5 leaves the D10 obligation intact");
 
+                // Compare the post-recovery durable state SEPARATELY against the
+                // pre-recovery snapshots: successful O5 mutates neither the record
+                // bytes, the journal metadata, nor the reserved-position count.
+                let meta_post_recover = store_b_concrete
+                    .get_signing_metadata()
+                    .expect("journal-metadata read after O5 recovery");
+                assert_eq!(rec_raw, rec_pre, "O5 recovery leaves the durable Reserved bytes unchanged");
+                assert_eq!(meta_post_recover, meta_pre, "O5 recovery leaves the journal metadata unchanged");
+                assert_eq!(journal_b.reserved_position_count(), count_pre, "O5 recovery leaves the reserved-position count unchanged");
+
                 // ---- Invoke the actual protected fresh route; require refusal. ----
                 let signer_obs = Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let sink_obs = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -12672,11 +12732,19 @@ mod tests {
 
                 // Independent operational/aggregate baselines with the surviving
                 // Vote/pin live; plus original pin provenance, record bytes,
-                // metadata, durable-position count, and ceilings.
+                // metadata, durable-position count, and ceilings established
+                // IMMEDIATELY before the protected refused attempt.
                 let ledgers_before = snapshot_ledgers(&owner_b);
                 let prov_before = pin_provenance_now(&owner_b, &b_decided);
                 let op_cap_before = owner_b.backend_for_test().accounting_cap();
                 let agg_cap_before = owner_b.backend_for_test().accounting_aggregate_cap();
+                let rec_before = store_b_concrete
+                    .get_signing_record(&pos.storage_key())
+                    .expect("record read before the refused attempt")
+                    .expect("the Reserved record persists before the refused attempt");
+                let meta_before = store_b_concrete
+                    .get_signing_metadata()
+                    .expect("journal-metadata read before the refused attempt");
                 let count_before = journal_b.reserved_position_count();
 
                 let outcome = fresh_vote_sign_real_local::<FixtureCommittedHistory>(
@@ -12705,8 +12773,12 @@ mod tests {
                     .get_signing_record(&pos.storage_key())
                     .expect("read")
                     .expect("the Reserved record still persists");
-                assert_eq!(rec_raw, rec_after, "the durable Reserved bytes are unchanged by the refusal");
-                assert_eq!(journal_b.reserved_position_count(), count_before, "durable-position count unchanged");
+                let meta_after = store_b_concrete
+                    .get_signing_metadata()
+                    .expect("journal-metadata read after the refusal");
+                assert_eq!(rec_after, rec_before, "the durable Reserved bytes are unchanged by the refusal");
+                assert_eq!(meta_after, meta_before, "the journal metadata is unchanged by the refusal");
+                assert_eq!(journal_b.reserved_position_count(), count_before, "durable-position count unchanged by the refusal");
 
                 // ---- Full surviving-process teardown to zero (abort ran no child
                 //      Drop, so NO child ledger restoration is claimed). ----
