@@ -9150,9 +9150,19 @@ mod tests {
                 owner.recovery_required(),
                 "a freshly reopened backend requires recovery before O5"
             );
+            // Proof-free standing baseline BEFORE O3 (after O2), sampled on BOTH
+            // ledgers independently.
+            let op_free = owner.backend_for_test().accounting_current();
+            let agg_free = owner.backend_for_test().accounting_aggregate_current();
             let recovery = owner
                 .read_validate(None::<&FixtureCommittedHistory>)
                 .expect("B O3 recovery proof");
+            // Proof-held standing baseline AFTER O3: the recovery proof holds a
+            // reservation strictly above the proof-free baseline.
+            let op_held = owner.backend_for_test().accounting_current();
+            let agg_held = owner.backend_for_test().accounting_aggregate_current();
+            assert!(op_held > op_free, "holding B's O3 recovery proof raises the operational standing charge");
+            assert!(agg_held > agg_free, "holding B's O3 recovery proof raises the aggregate standing charge");
             // Direct recovered-restriction / reconstructed-engine-lock comparison
             // (NOT a lifecycle predicate requiring a B capture that does not exist).
             let durable = GenerationIdentity::from_retained(recovery.retained())
@@ -9170,9 +9180,18 @@ mod tests {
                 other => panic!("B O5 must acknowledge, got {other:?}"),
             }
             assert!(!owner.recovery_required(), "a successful B O5 clears recovery");
+            // Immediately after the successful O5 (its proof still held) the standing
+            // charge is restored EXACTLY to the proof-held baseline: O5's additional
+            // working set is transient and released on return.
+            assert_eq!(owner.backend_for_test().accounting_current(), op_held, "successful O5 restores exactly to the proof-held operational baseline");
+            assert_eq!(owner.backend_for_test().accounting_aggregate_current(), agg_held, "successful O5 restores exactly to the proof-held aggregate baseline");
             // Drop the recovery proof BEFORE obtaining the separate capture proof,
             // preventing accidental overlap of two full proofs.
             drop(recovery);
+            // After dropping the recovery proof, before obtaining the capture proof,
+            // the standing charge returns EXACTLY to the proof-free baseline.
+            assert_eq!(owner.backend_for_test().accounting_current(), op_free, "dropping the recovery proof restores the proof-free operational baseline");
+            assert_eq!(owner.backend_for_test().accounting_aggregate_current(), agg_free, "dropping the recovery proof restores the proof-free aggregate baseline");
             let cap_proof = owner
                 .read_validate(None::<&FixtureCommittedHistory>)
                 .expect("B O3 proof for capture");
@@ -9601,7 +9620,21 @@ mod tests {
             }
             assert!(owner_b.recovery_required(), "the foreign-proof refusal leaves recovery required");
 
-            // Durable safety bytes AND revision are unchanged by the refusal.
+            // IMMEDIATELY after the refusal, BEFORE any O3/O2 durable inspection:
+            // B gained NO standing charge (both ledgers), B's ceilings are unchanged,
+            // and A's holder charge stayed on A (both ledgers). Sampling here isolates
+            // the refusal's (non-)effect from the transient allocations the durable
+            // inspection below would introduce.
+            assert_eq!(owner_b.backend_for_test().accounting_current(), b_op_before, "refused A proof added no operational charge to B");
+            assert_eq!(b_acct.aggregate().current(), b_agg_before, "refused A proof added no aggregate charge to B");
+            assert_eq!(owner_b.backend_for_test().accounting_cap(), b_op_cap, "B operational ceiling unchanged");
+            assert_eq!(owner_b.backend_for_test().accounting_aggregate_cap(), b_agg_cap, "B aggregate ceiling unchanged");
+            assert_eq!(a_acct.current(), a_op_after_close, "A's operational holder charge stayed on A through the refusal");
+            assert_eq!(a_acct.aggregate().current(), a_agg_after_close, "A's aggregate holder charge stayed on A through the refusal");
+
+            // Durable safety bytes AND revision are unchanged by the refusal
+            // (a separate comparison; revision equality alone is insufficient, so the
+            // full encoded bytes are compared).
             let durable_post = owner_b.read_validate(None::<&FixtureCommittedHistory>).expect("B O3 post");
             assert_eq!(durable_post.encoded(), bytes_before.as_slice(), "durable safety-record bytes unchanged");
             assert_eq!(durable_post.publication_revision(), rev_before, "authoritative revision unchanged");
@@ -9609,27 +9642,24 @@ mod tests {
             assert_eq!(meta_before.current_revision, meta_after.current_revision, "O2 current revision unchanged");
             drop(durable_post);
 
-            // B gained NO standing charge from the refusal (both ledgers), and B's
-            // ceilings are unchanged. Sampled immediately after the refusal.
-            assert_eq!(owner_b.backend_for_test().accounting_current(), b_op_before, "refused A proof added no operational charge to B");
-            assert_eq!(b_acct.aggregate().current(), b_agg_before, "refused A proof added no aggregate charge to B");
-            assert_eq!(owner_b.backend_for_test().accounting_cap(), b_op_cap, "B operational ceiling unchanged");
-            assert_eq!(owner_b.backend_for_test().accounting_aggregate_cap(), b_agg_cap, "B aggregate ceiling unchanged");
-            // The A proof's holder stayed charged to A (both ledgers) throughout.
-            assert_eq!(a_acct.current(), a_op_after_close, "A's operational holder charge stayed on A");
-            assert_eq!(a_acct.aggregate().current(), a_agg_after_close, "A's aggregate holder charge stayed on A");
-
             // A genuine B-issued proof then succeeds (the retained control).
             let (mut engine_b, p1_b, l0_block) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
             let b_decided = reopen_b_recover_and_capture(&owner_b, &mut engine_b, &p1_b, &lim, l0_block);
             let _ = (&b_decided, &p1_a);
 
-            // Dropping the retained A proof releases A's holder charge EXACTLY on
-            // BOTH of A's ledgers (proof-held vs proof-free boundary), and never
-            // perturbs B.
+            // Snapshot BOTH B ledgers immediately before dropping A's proof.
+            let b_op_pre_drop = owner_b.backend_for_test().accounting_current();
+            let b_agg_pre_drop = owner_b.backend_for_test().accounting_aggregate_current();
+
+            // The retained A proof is now the ONLY remaining charged A object (A's
+            // envelope was dropped before the reopen), so dropping it releases A's
+            // holder charge EXACTLY to zero on BOTH of A's ledgers.
             drop(a_proof);
-            assert!(a_acct.current() < a_op_after_close, "dropping the A proof releases A's operational holder charge");
-            assert!(a_acct.aggregate().current() < a_agg_after_close, "dropping the A proof releases A's aggregate holder charge");
+            assert_eq!(a_acct.current(), 0, "dropping the last charged A object zeroes A's operational ledger");
+            assert_eq!(a_acct.aggregate().current(), 0, "dropping the last charged A object zeroes A's aggregate ledger");
+            // Dropping A's proof never perturbs B (both ledgers unchanged).
+            assert_eq!(owner_b.backend_for_test().accounting_current(), b_op_pre_drop, "B's operational ledger is unchanged by dropping A's proof");
+            assert_eq!(owner_b.backend_for_test().accounting_aggregate_current(), b_agg_pre_drop, "B's aggregate ledger is unchanged by dropping A's proof");
         }
 
         // ------------------------------------------------------------------
@@ -9682,6 +9712,22 @@ mod tests {
             let a_agg_live = a_acct.aggregate().current();
             assert!(a_op_live > 0 && a_agg_live > 0, "retained A objects keep both A ledgers charged after close");
 
+            // Test-local A-preservation check: at EACH refusal, A's COMPLETE
+            // provenance (through A's OWN retained registry observer, not B's
+            // rejecting lookup), A's COMPLETE borrowed Vote, and BOTH of A's ledgers
+            // are unchanged before the next operation.
+            let check_a = |label: &str| {
+                let now = a_registry
+                    .lock()
+                    .expect("A registry lock")
+                    .provenance_by_handle(a_handle)
+                    .expect("A's own registry still resolves A's pin provenance");
+                assert_eq!(now, a_prov_before, "{label}: A's complete provenance preserved through A's registry");
+                assert_eq!(a_decided.vote(), &a_prov_before_vote, "{label}: A's complete borrowed Vote is unchanged");
+                assert_eq!(a_acct.current(), a_op_live, "{label}: A's operational charge stays on A");
+                assert_eq!(a_acct.aggregate().current(), a_agg_live, "{label}: A's aggregate charge stays on A");
+            };
+
             let owner_b = reopen_attach(safety_dir.path(), &ctx);
             let store_b = reopen_open_journal_store(journal_dir.path());
             let journal_b =
@@ -9722,6 +9768,7 @@ mod tests {
             // Fresh refusal restored B's ledgers and mutated no durable state.
             assert_eq!(snapshot_ledgers(&owner_b), ledgers_p1, "the Missing-phase fresh attempt restores B's ledgers");
             assert_eq!(journal_b.reserved_position_count(), 0, "Missing-phase fresh attempt creates no durable position");
+            check_a("Missing-phase fresh refusal");
             {
                 let mut rsink = RetainedUseRecordingSink::new();
                 let mut rcoord = ModelCoordinationHook::inert();
@@ -9735,10 +9782,7 @@ mod tests {
             assert_eq!(snapshot_ledgers(&owner_b), ledgers_p1, "the Missing-phase checked attempt restores B's ledgers");
             assert_eq!(signer.calls(), 0, "zero signing during the Missing phase");
             assert_eq!(journal_b.reserved_position_count(), 0, "no durable position created in the Missing phase");
-            assert_eq!(a_decided.vote(), &a_prov_before_vote, "the borrowed A Vote is unchanged across the Missing phase");
-            // A's reservations are NOT attributed to B: A's ledgers stay charged.
-            assert_eq!(a_acct.current(), a_op_live, "A's operational charge is unchanged by B's Missing-phase attempts");
-            assert_eq!(a_acct.aggregate().current(), a_agg_live, "A's aggregate charge is unchanged by B's Missing-phase attempts");
+            check_a("Missing-phase checked refusal");
 
             // Legitimate B capture installs B's registry.
             let cap_proof = owner_b.read_validate(None::<&FixtureCommittedHistory>).expect("B O3 for capture");
@@ -9768,6 +9812,7 @@ mod tests {
                 assert_eq!(fsink.calls, 0);
             }
             assert_eq!(snapshot_ledgers(&owner_b), ledgers_p2, "the Foreign-phase fresh attempt restores B's ledgers");
+            check_a("Foreign-phase fresh refusal");
             {
                 let mut rsink = RetainedUseRecordingSink::new();
                 let mut rcoord = ModelCoordinationHook::inert();
@@ -9781,21 +9826,23 @@ mod tests {
             assert_eq!(snapshot_ledgers(&owner_b), ledgers_p2, "the Foreign-phase checked attempt restores B's ledgers");
             assert_eq!(signer.calls(), 0, "zero signing across both phases");
             assert_eq!(journal_b.reserved_position_count(), 0, "no durable position created across both phases");
+            check_a("Foreign-phase checked refusal");
 
             // A-provenance PRESERVATION is a BEFORE/AFTER check through the retained
-            // A registry observer: the COMPLETE PreparedProvenance A resolved before
-            // close is identical afterwards. This is NOT a comparison with B's
-            // identity (B's lookup of the A pin is Foreign, asserted above).
-            let a_prov_after = a_registry
-                .lock()
-                .expect("A registry lock")
-                .provenance_by_handle(a_handle)
-                .expect("A's own registry still resolves A's pin provenance");
-            assert_eq!(a_prov_after, a_prov_before, "A's complete pin provenance is preserved across the reopen and B's attempts");
-            assert_eq!(a_decided.vote(), &a_prov_before_vote, "A's complete borrowed Vote is unchanged throughout");
-            // A's charges remain on A (both ledgers), never attributed to B.
-            assert_eq!(a_acct.current(), a_op_live, "A's operational charge stayed on A");
-            assert_eq!(a_acct.aggregate().current(), a_agg_live, "A's aggregate charge stayed on A");
+            // A registry observer (asserted at EACH refusal above via `check_a`): the
+            // COMPLETE PreparedProvenance A resolved before close is identical
+            // afterwards. This is NOT a comparison with B's identity (B's lookup of
+            // the A pin is Foreign, asserted above).
+
+            // Release the retained A owners: A's unchanged envelope (`a_decided`,
+            // whose pin holds one registry Arc) AND A's registry observer
+            // (`a_registry`, the other Arc). Only once BOTH drop does the registry's
+            // reservation release, zeroing A's ledgers — observed through the
+            // independent `a_acct` handle. No separately invented pin is dropped.
+            drop(a_decided);
+            drop(a_registry);
+            assert_eq!(a_acct.current(), 0, "releasing the retained A objects zeroes A's operational ledger");
+            assert_eq!(a_acct.aggregate().current(), 0, "releasing the retained A objects zeroes A's aggregate ledger");
         }
 
         // ------------------------------------------------------------------
@@ -9837,11 +9884,45 @@ mod tests {
                 .expect("read")
                 .expect("the Signed record persists");
 
+            // Retain A's registry observer and snapshot A's COMPLETE provenance +
+            // Vote BEFORE closing A (the A-provenance preservation reference, through
+            // A's OWN registry — never B's rejecting lookup).
+            let a_registry = {
+                let g = owner_a.backend_for_test().lock_domain();
+                owner_a
+                    .backend_for_test()
+                    .prepared_registry_installed(&g)
+                    .expect("A registry installed after capture")
+            };
+            let a_handle = a_decided.payload().pin().handle();
+            let a_prov_before = a_registry
+                .lock()
+                .expect("A registry lock")
+                .provenance_by_handle(a_handle)
+                .expect("A's registry resolves A's pin provenance before close");
+            let a_acct = owner_a.backend_for_test().accounting_handle_for_test();
+
             drop(journal_a);
             drop(store_a);
             drop(engine_a);
             drop(owner_a);
-            // a_decided retained for the pre-O5 attempts.
+            // a_decided + a_registry retained for the pre-O5 attempts; sample A's
+            // standing baseline on BOTH ledgers independently after the close.
+            let a_op_live = a_acct.current();
+            let a_agg_live = a_acct.aggregate().current();
+            assert!(a_op_live > 0 && a_agg_live > 0, "retained A objects keep both A ledgers charged after close");
+            // Test-local A-preservation check used at each pre-O5 refusal.
+            let check_a = |label: &str| {
+                let now = a_registry
+                    .lock()
+                    .expect("A registry lock")
+                    .provenance_by_handle(a_handle)
+                    .expect("A's own registry still resolves A's pin provenance");
+                assert_eq!(now, a_prov_before, "{label}: A's complete provenance preserved through A's registry");
+                assert_eq!(a_decided.vote(), &a_base_vote, "{label}: A's complete borrowed Vote is unchanged");
+                assert_eq!(a_acct.current(), a_op_live, "{label}: A's operational charge stays on A");
+                assert_eq!(a_acct.aggregate().current(), a_agg_live, "{label}: A's aggregate charge stays on A");
+            };
 
             let owner_b = reopen_attach(safety_dir.path(), &ctx);
             let store_b_concrete = reopen_open_journal_store(journal_dir.path());
@@ -9851,8 +9932,15 @@ mod tests {
             // O2 and O3 do NOT clear recovery.
             let meta = owner_b.open().expect("B O2");
             assert!(owner_b.recovery_required(), "O2 does not clear recovery");
+            let op_free = owner_b.backend_for_test().accounting_current();
+            let agg_free = owner_b.backend_for_test().accounting_aggregate_current();
             let recovery = owner_b.read_validate(None::<&FixtureCommittedHistory>).expect("B O3");
             assert!(owner_b.recovery_required(), "O3 does not clear recovery");
+            // Proof-held standing baseline after O3.
+            let op_held = owner_b.backend_for_test().accounting_current();
+            let agg_held = owner_b.backend_for_test().accounting_aggregate_current();
+            assert!(op_held > op_free, "holding B's O3 proof raises the operational standing charge");
+            assert!(agg_held > agg_free, "holding B's O3 proof raises the aggregate standing charge");
 
             let (mut engine_b, p1_b, _l0) = engine_locked_l0_multi_with_suite(MODEL_SUITE_U16);
             let _ = (&p1_b,);
@@ -9877,6 +9965,7 @@ mod tests {
                 .expect("the Signed record is unchanged");
             assert_eq!(record_before, record_mid_fresh, "the stored Signed result is unchanged by the pre-O5 fresh attempt");
             assert_eq!(journal_b.reserved_position_count(), 1, "durable-position count unchanged by the pre-O5 fresh attempt");
+            check_a("pre-O5 fresh refusal");
 
             // Retained refusal checked and asserted SEPARATELY.
             let mut rsink = RetainedUseRecordingSink::new();
@@ -9895,12 +9984,26 @@ mod tests {
                 .expect("the Signed record is unchanged");
             assert_eq!(record_before, record_mid, "the stored Signed result is unchanged by pre-O5 attempts");
             assert_eq!(journal_b.reserved_position_count(), 1, "the durable-position count is unchanged");
+            check_a("pre-O5 checked refusal");
 
             // O5 itself is permitted during recovery.
             assert!(matches!(owner_b.reacknowledge(&recovery), PublishResult::DurableAcknowledged { .. }), "O5 is permitted during recovery");
             assert!(!owner_b.recovery_required(), "the successful O5 clears recovery");
+            // Proof-held restoration immediately after the successful O5 (proof live).
+            assert_eq!(owner_b.backend_for_test().accounting_current(), op_held, "successful O5 restores exactly to the proof-held operational baseline");
+            assert_eq!(owner_b.backend_for_test().accounting_aggregate_current(), agg_held, "successful O5 restores exactly to the proof-held aggregate baseline");
+            drop(recovery);
+            // Proof-free restoration after dropping the recovery proof.
+            assert_eq!(owner_b.backend_for_test().accounting_current(), op_free, "dropping the recovery proof restores the proof-free operational baseline");
+            assert_eq!(owner_b.backend_for_test().accounting_aggregate_current(), agg_free, "dropping the recovery proof restores the proof-free aggregate baseline");
             let _ = (&mut engine_b, meta);
+            // Release the retained A owners (unchanged envelope + A's registry
+            // observer, the two Arcs to A's registry) and assert BOTH of A's ledgers
+            // reach zero through the independent handle. No separately invented pin.
             drop(a_decided);
+            drop(a_registry);
+            assert_eq!(a_acct.current(), 0, "releasing the retained A objects zeroes A's operational ledger");
+            assert_eq!(a_acct.aggregate().current(), 0, "releasing the retained A objects zeroes A's aggregate ledger");
         }
 
         // ------------------------------------------------------------------
@@ -9997,7 +10100,6 @@ mod tests {
                 "the engine/durable disagreement retained refusal",
             );
         }
-
 
         mod checked_retained {
             use super::*;
